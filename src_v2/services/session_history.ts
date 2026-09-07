@@ -8,6 +8,7 @@ import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
 import { ChatMessage } from "../core/types.js";
+import { thoughtSignatureStore } from "./thought_signature_store.js";
 
 function flattenResponseFunctionCallName(item: any): string {
   if (item?.type === "computer_call") return "mcp__node_repl_js";
@@ -108,7 +109,13 @@ function reasoningContentFromItem(item: any): string {
 
 function thoughtSignatureFromItem(item: any): string {
   const value = item?.thought_signature || item?.thoughtSignature || item?.signature;
-  return typeof value === "string" ? value.trim() : "";
+  if (typeof value === "string" && value.trim()) return value.trim();
+  const id = item?.call_id || item?.id;
+  if (id) {
+    const fromStore = thoughtSignatureStore.get(String(id));
+    if (fromStore) return fromStore;
+  }
+  return "";
 }
 
 function toolCallNameFromChatCall(call: any): string {

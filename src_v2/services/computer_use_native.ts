@@ -399,7 +399,7 @@ export function normalizeNativeComputerUseToolArguments(
       "    tmpDir: __opencodexOriginalNodeRepl.tmpDir,",
       "    requestMeta: __opencodexOriginalNodeRepl.requestMeta,",
       "    write: (value) => { __opencodexAppendText(value); return Reflect.apply(__opencodexOriginalNodeRepl.write, __opencodexOriginalNodeRepl, [value]); },",
-      "    emitImage: async (value) => { const result = await Reflect.apply(__opencodexOriginalNodeRepl.emitImage, __opencodexOriginalNodeRepl, [value]); await __opencodexCaptureImage(value); return result; },",
+      "    emitImage: async (value) => { const unwrapped = (value && typeof value === 'object' && !Buffer.isBuffer(value) && (value.data || value.bytes)) ? (value.data || value.bytes) : value; const result = await Reflect.apply(__opencodexOriginalNodeRepl.emitImage, __opencodexOriginalNodeRepl, [unwrapped]); await __opencodexCaptureImage(value); return result; },",
       "    setResponseMeta: (meta) => typeof __opencodexOriginalNodeRepl.setResponseMeta === 'function' ? Reflect.apply(__opencodexOriginalNodeRepl.setResponseMeta, __opencodexOriginalNodeRepl, [meta]) : undefined,",
       "  };",
       "  const __opencodexOriginalConsole = globalThis.console;",

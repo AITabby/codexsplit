@@ -4,6 +4,7 @@
 
 import { ProtocolAdapter } from "./base.js";
 import { ChatMessage, ChatCompletionRequestBody } from "../core/types.js";
+import { thoughtSignatureStore } from "../services/thought_signature_store.js";
 
 function sanitizeGeminiSchema(schema: any): any {
   if (!schema || typeof schema !== "object") {
@@ -82,7 +83,35 @@ function appendGeminiContentParts(parts: any[], content: any): void {
 
 function toolCallThoughtSignature(toolCall: any): string {
   const value = toolCall?.thought_signature || toolCall?.thoughtSignature || toolCall?.signature;
-  return typeof value === "string" ? value.trim() : "";
+  if (typeof value === "string" && value.trim()) return value.trim();
+  const id = toolCall?.id || toolCall?.call_id;
+  if (id) {
+    const fromStore = thoughtSignatureStore.get(String(id));
+    if (fromStore) return fromStore;
+  }
+  return "";
+}
+
+function extractToolTextOutput(content: any): string {
+  if (typeof content === "string") return content;
+  if (!content) return "";
+  if (Array.isArray(content)) {
+    const texts: string[] = [];
+    for (const part of content) {
+      if (typeof part === "string") {
+        if (part) texts.push(part);
+      } else if (part && typeof part === "object") {
+        if (part.type === "text" || part.type === "input_text" || part.type === "output_text") {
+          if (part.text) texts.push(String(part.text));
+        }
+      }
+    }
+    return texts.join("\n");
+  }
+  if (typeof content === "object") {
+    return JSON.stringify(content);
+  }
+  return String(content);
 }
 
 function appendLegacyToolImages(parts: any[], content: any): void {
@@ -174,7 +203,7 @@ export class GoogleGeminiAdapter implements ProtocolAdapter {
           parts.push({
             functionResponse: {
               name: responseName,
-              response: { output: typeof msg.content === "string" ? msg.content : JSON.stringify(msg.content || "") }
+              response: { output: extractToolTextOutput(msg.content) }
             }
           });
         }
@@ -283,6 +312,7 @@ export class GoogleGeminiAdapter implements ProtocolAdapter {
         if (sig) {
           toolCallObj.thought_signature = sig;
           toolCallObj.thoughtSignature = sig;
+          thoughtSignatureStore.set(toolCallObj.id, sig);
         }
         chunks.push({
           choices: [{

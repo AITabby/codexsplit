@@ -22,6 +22,7 @@ import {
   isNativeComputerUseMcpTool,
   isNativeComputerUseExecutorName,
 } from "../services/computer_use_native.js";
+import { thoughtSignatureStore } from "../services/thought_signature_store.js";
 
 const THINK_TAG_REGEX = /<think>[\s\S]*?<\/think>/gi;
 
@@ -182,7 +183,14 @@ function appendChatToolCall(messages: ChatMessage[], item: any): string {
   const argsStr = typeof rawArguments === "string"
     ? rawArguments
     : JSON.stringify(rawArguments || {});
-  const thoughtSignature = String(item?.thought_signature || item?.thoughtSignature || item?.signature || "").trim();
+  const thoughtSignature = String(
+    item?.thought_signature
+    || item?.thoughtSignature
+    || item?.signature
+    || thoughtSignatureStore.get(callId)
+    || (item?.id ? thoughtSignatureStore.get(item.id) : "")
+    || ""
+  ).trim();
   const toolCall = {
     id: callId,
     type: "function" as const,

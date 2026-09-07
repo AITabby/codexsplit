@@ -18,6 +18,7 @@ import {
   nativeComputerUseMcpDescriptor,
   normalizeNativeComputerUseToolArguments,
 } from "../services/computer_use_native.js";
+import { thoughtSignatureStore } from "../services/thought_signature_store.js";
 
 export class ThinkTagFilter {
   private isThinking = false;
@@ -603,6 +604,10 @@ export class ResponsesStreamEngine {
     }
     if (call.thought_signature || call.thoughtSignature || call.signature) {
       state.thought_signature = String(call.thought_signature || call.thoughtSignature || call.signature);
+    }
+    if (state.thought_signature) {
+      thoughtSignatureStore.set(state.call_id, state.thought_signature);
+      if (state.id) thoughtSignatureStore.set(state.id, state.thought_signature);
     }
 
     if (isInternalImageCall || isInternalGatewayCall) {

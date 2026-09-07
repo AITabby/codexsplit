@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { convertToolsToChatTools, responsesInputToChatMessages, transformResponsesToChat } from "../dist/core/transformer.js";
 import { ResponsesStreamEngine } from "../dist/core/stream_engine.js";
 import { GoogleGeminiAdapter } from "../dist/adapters/google.js";
+import { thoughtSignatureStore } from "../dist/services/thought_signature_store.js";
 import {
   NATIVE_COMPUTER_USE_EXECUTOR_NAMES,
   NATIVE_COMPUTER_USE_SYSTEM_INSTRUCTIONS,
@@ -455,3 +456,106 @@ test("Responses MCP continuations become Chat tool calls and outputs", () => {
   assert.equal(messages[2].tool_call_id, "mcp_native_1");
   assert.equal(messages[3].tool_call_id, "mcp_native_2");
 });
+
+test("Gemini Computer Use preserves thought signature and Accessibility Tree across multi-turn continuations", async () => {
+  const adapter = new GoogleGeminiAdapter();
+  thoughtSignatureStore.clear();
+
+  // 1. Turn 1: Gemini emits a tool call with thought_signature
+  const sig = "sig_gemini_test_token_987654321";
+  const geminiChunk = {
+    candidates: [{
+      content: {
+        parts: [{
+          thoughtSignature: sig,
+          functionCall: {
+            name: "mcp__node_repl_js",
+            args: { action: "raw_node_code", code: "sky.get_app_state()" },
+          },
+        }],
+      },
+    }],
+  };
+
+  const parsedChunks = adapter.processStreamChunk(geminiChunk);
+  assert.equal(parsedChunks.length, 1);
+  const toolCall = parsedChunks[0].choices[0].delta.tool_calls[0];
+  assert.equal(toolCall.function.name, "mcp__node_repl_js");
+  assert.equal(toolCall.thought_signature, sig);
+  const turn1CallId = toolCall.id;
+  assert.equal(thoughtSignatureStore.get(turn1CallId), sig);
+
+  // 2. Stream engine processes the chunk and emits output items
+  const events = [];
+  const engine = new ResponsesStreamEngine("gemini-3.6-flash-medium", "turn-1-id");
+  const emit = async (ev) => events.push(ev);
+  await engine.start(emit);
+  await engine.processChatChunk(emit, parsedChunks[0]);
+  await engine.finish(emit);
+
+  const completedCall = events.find((e) => e.type === "response.completed")?.response?.output?.find((i) => i.type === "function_call");
+  assert.equal(completedCall?.call_id, turn1CallId);
+  const turn1ItemId = completedCall?.id;
+  assert.equal(thoughtSignatureStore.get(turn1ItemId), sig);
+
+  // 3. Turn 2: Codex Desktop executes tool and sends continuation to /v1/responses
+  // Notice Codex Desktop sends NO thought_signature!
+  const accessibilityTree = '{"role":"AXApplication","name":"Google Chrome","title":"Zhihu - Explore","children":[{"role":"AXButton","name":"Comment"}]}';
+  const continuationReqBody = {
+    model: "gemini-3.6-flash-medium",
+    input: [
+      {
+        type: "message",
+        role: "user",
+        content: "charome新标签访问知乎滚动几下，点击一篇文章评论",
+      },
+      {
+        type: "function_call",
+        id: turn1ItemId,
+        call_id: turn1CallId,
+        name: "mcp__node_repl_js",
+        arguments: '{"action":"raw_node_code","code":"sky.get_app_state()"}',
+      },
+      {
+        type: "function_call_output",
+        call_id: turn1CallId,
+        output: [
+          { type: "text", text: accessibilityTree },
+          { type: "image_url", image_url: { url: "data:image/jpeg;base64,dGVzdF9zY3JlZW5zaG90" } },
+        ],
+      },
+    ],
+  };
+
+  const chatBody = transformResponsesToChat(continuationReqBody, "gemini-3.6-flash-medium", "session-cu-123");
+  const assistantMsg = chatBody.messages.find((m) => m.role === "assistant");
+  assert.ok(assistantMsg);
+  assert.equal(assistantMsg.tool_calls[0].thought_signature, sig, "Thought signature must be rehydrated in ChatMessage");
+
+  const geminiPayload = adapter.transformPayload(chatBody).body;
+  assert.ok(geminiPayload.contents, "Gemini payload contents must be present");
+
+  // Verify functionCall was NOT dropped
+  const modelTurn = geminiPayload.contents.find((c) => c.role === "model");
+  assert.ok(modelTurn, "Model turn with functionCall must be preserved");
+  const fcPart = modelTurn.parts.find((p) => p.functionCall);
+  assert.ok(fcPart, "functionCall part must exist");
+  assert.equal(fcPart.functionCall.name, "mcp__node_repl_js");
+  assert.equal(fcPart.thoughtSignature, sig, "functionCall must carry thoughtSignature");
+
+  // Verify functionResponse was NOT dropped and contains clean accessibility tree (no base64 pollution)
+  const toolTurn = geminiPayload.contents.find((c) => c.role === "user" && c.parts.some((p) => p.functionResponse));
+  assert.ok(toolTurn, "User turn with functionResponse must exist");
+  const frPart = toolTurn.parts.find((p) => p.functionResponse);
+  assert.ok(frPart, "functionResponse part must exist");
+  assert.equal(frPart.functionResponse.name, "mcp__node_repl_js");
+  assert.equal(frPart.functionResponse.response.output, accessibilityTree, "functionResponse output must be clean accessibility tree text");
+  assert.doesNotMatch(frPart.functionResponse.response.output, /dGVzdF9zY3JlZW5zaG90/, "Raw base64 screenshot must NOT be stringified inside functionResponse.output");
+
+  // Verify screenshot is provided as inlineData beside functionResponse
+  const inlineImgPart = toolTurn.parts.find((p) => p.inlineData);
+  assert.ok(inlineImgPart, "Screenshot must be attached as inlineData");
+  assert.equal(inlineImgPart.inlineData.mimeType, "image/jpeg");
+  assert.equal(inlineImgPart.inlineData.data, "dGVzdF9zY3JlZW5zaG90");
+});
+
