@@ -3476,7 +3476,30 @@ async function runProviderBridge(): Promise<void> {
     const nativeId = threadIdFrom(params.threadId || thread.id);
     if (nativeId && isSuppressed(runtime, nativeId)) return null;
     if (nativeId && isRetiredNativeId(nativeId)) return null;
-    const route = nativeId ? routeForNativeId(nativeId) : null;
+    let route = nativeId ? routeForNativeId(nativeId) : null;
+    if (!route && nativeId && (message.method === "thread/started" || message.method === "turn/started" || message.method === "thread/resume")) {
+      const threadModel = cleanString(thread.model || params.model);
+      const isThirdParty = providerForModel(threadModel) === GATEWAY_PROVIDER;
+      route = saveRoute({
+        externalId: nativeId,
+        nativeId,
+        nativePath: cleanString(thread.path) || undefined,
+        selectedModel: threadModel || nativeDefaultModel(),
+        threadSource: threadSource(params) || undefined,
+        threadOrigin: threadOrigin(params),
+      });
+      if (isThirdParty) {
+        try {
+          const dbPath = path.join(codexHomeDir(), "state_5.sqlite");
+          if (fs.existsSync(dbPath)) {
+            execFileSync("sqlite3", [
+              dbPath,
+              `UPDATE threads SET model_provider = 'opencodex' WHERE id = '${nativeId}' AND model_provider != 'opencodex';`,
+            ], { stdio: "ignore" });
+          }
+        } catch {}
+      }
+    }
     const childDisplay = nativeId
       ? nativeSubagentDisplaySettings.get(nativeId) || (route ? nativeDisplaySettingsForRoute(route, nativeId) : undefined)
       : undefined;

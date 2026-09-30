@@ -483,11 +483,11 @@ export function buildManagedCodexConfig(
   catalogPath = path.join(opencodexDataDir(), "custom_model_catalog.json")
 ): string {
   const preserved = stripManagedCodexConfig(content);
-  // Keep the global default on native OpenAI. The provider bridge explicitly
-  // assigns provider-owned models to opencodex at the thread/turn boundary;
-  // making the gateway the global default hides native history whenever the
-  // Desktop client is not yet attached to the bridge.
-  const managedTop = `# >>> opencodex managed >>>\nmodel_catalog_json = "${catalogPath}"\nmodel_provider = "openai"\ncheck_for_update_on_startup = false\n# <<< opencodex managed >>>\n`;
+  // Default to opencodex so that new threads created via mobile / remote control
+  // (which bypass the Desktop-only stdio bridge) route through the OpenCodex
+  // gateway. The gateway transparently proxies official models to OpenAI and
+  // routes third-party models to their configured providers.
+  const managedTop = `# >>> opencodex managed >>>\nmodel_catalog_json = "${catalogPath}"\nmodel_provider = "opencodex"\ncheck_for_update_on_startup = false\n# <<< opencodex managed >>>\n`;
   const managedProvider = `\n# >>> opencodex managed >>>\n[model_providers.opencodex]\nname = "CodexSplit"\nbase_url = "http://127.0.0.1:${port}/v1"\nwire_api = "responses"\nrequires_openai_auth = true\nexperimental_bearer_token = "${adminToken}"\nrequest_max_retries = 3\nstream_max_retries = 3\nstream_idle_timeout_ms = 1800000\n# <<< opencodex managed >>>\n`;
   return `${managedTop}\n${preserved}\n${managedProvider}`;
 }
@@ -1979,7 +1979,9 @@ export function repairDatabaseThreads(): void {
     if (fs.existsSync(dbPath)) {
       execFileSync("sqlite3", [
         dbPath,
-        "UPDATE threads SET model_provider = 'opencodex' WHERE model_provider != 'opencodex' AND (model LIKE '%/%' OR model LIKE '%gemini%' OR model LIKE '%minimax%' OR model LIKE '%claude%' OR model LIKE '%deepseek%' OR model LIKE '%qwen%');",
+        "UPDATE threads SET model_provider = 'opencodex' WHERE model_provider != 'opencodex' AND (model LIKE '%/%' OR model LIKE '%gemini%' OR model LIKE '%minimax%' OR model LIKE '%claude%' OR model LIKE '%deepseek%' OR model LIKE '%qwen%');" +
+        "CREATE TRIGGER IF NOT EXISTS opencodex_auto_provider_insert AFTER INSERT ON threads FOR EACH ROW WHEN NEW.model_provider = 'openai' AND (NEW.model LIKE '%/%' OR NEW.model LIKE '%gemini%' OR NEW.model LIKE '%minimax%' OR NEW.model LIKE '%claude%' OR NEW.model LIKE '%deepseek%' OR NEW.model LIKE '%qwen%') BEGIN UPDATE threads SET model_provider = 'opencodex' WHERE id = NEW.id; END;" +
+        "CREATE TRIGGER IF NOT EXISTS opencodex_auto_provider_update AFTER UPDATE OF model ON threads FOR EACH ROW WHEN NEW.model_provider = 'openai' AND (NEW.model LIKE '%/%' OR NEW.model LIKE '%gemini%' OR NEW.model LIKE '%minimax%' OR NEW.model LIKE '%claude%' OR NEW.model LIKE '%deepseek%' OR NEW.model LIKE '%qwen%') BEGIN UPDATE threads SET model_provider = 'opencodex' WHERE id = NEW.id; END;",
       ], { stdio: "ignore" });
     }
   } catch {}

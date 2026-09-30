@@ -1289,7 +1289,7 @@ rl.on("line", (line) => {
   }
 });
 
-test("1.1.5 managed config keeps native OpenAI as the global default", () => {
+test("managed config keeps opencodex as default for remote mobile and local gateway routing", () => {
   const config = buildManagedCodexConfig(
     'model = "gpt-5.5"\n',
     8765,
@@ -1297,8 +1297,8 @@ test("1.1.5 managed config keeps native OpenAI as the global default", () => {
     "/tmp/custom_model_catalog.json",
   );
 
-  assert.match(config, /model_provider = "openai"/);
-  assert.doesNotMatch(config, /model_provider = "opencodex"/);
+  assert.match(config, /model_provider = "opencodex"/);
+  assert.doesNotMatch(config, /model_provider = "openai"/);
   assert.doesNotMatch(config, /openai_base_url/);
   assert.match(config, /base_url = "http:\/\/127\.0\.0\.1:8765\/v1"/);
 });
