@@ -444,6 +444,15 @@ export type GatewaySubagentDispatcher = (
 
 
 
+export const PROVIDER_TURN_TIMEOUT_MS = (() => {
+  const raw = process.env.OPENCODEX_PROVIDER_TURN_TIMEOUT_MS;
+  if (raw !== undefined && raw !== "") {
+    const parsed = Number(raw);
+    if (Number.isFinite(parsed) && parsed > 0) return Math.floor(parsed);
+  }
+  return 1800000; // 30 minutes (was 10 minutes)
+})();
+
 const CURSOR_TEXT_IDLE_TIMEOUT_MS = 2000;
 const CURSOR_TOOL_IDLE_TIMEOUT_MS = 8000;
 // Some OpenAI-compatible gateways omit both finish_reason and [DONE] after a
@@ -1727,12 +1736,14 @@ export class GatewayRouter {
       providerUrl,
       upstreamModel,
     );
+    const adapter = AdapterFactory.getAdapter(reqBody?.protocol, providerUrl, adapterName);
+    const effectiveAdapterName = adapterName || adapter.name;
     let chatBody = transformResponsesToChat(
       reqBody,
       upstreamModel,
       sessionId,
       !isSubagentRequest,
-      adapterName,
+      effectiveAdapterName,
       providerReasoningContent,
     );
     // SessionHistoryService may rehydrate screenshots from the native rollout
@@ -1785,7 +1796,6 @@ export class GatewayRouter {
         `bytes=${optimizedChat.stats.inputBytes}->${optimizedChat.stats.outputBytes}`,
       );
     }
-    const adapter = AdapterFactory.getAdapter(reqBody?.protocol, providerUrl, adapterName);
     const { urlEndpoint, headers: adapterHeaders, body: payloadBody } = adapter.transformPayload(providerChatBody);
 
     // Callers may provide either a provider base URL or an already selected
@@ -1841,9 +1851,23 @@ export class GatewayRouter {
         activeAdapter = new GoogleGeminiAdapter();
         const geminiPayload = activeAdapter.transformPayload(optimizedChatBody).body;
 
+        let antigravityModel = upstreamModel;
+        const requestedEffort = String(
+          optimizedChatBody?.reasoning_effort
+          || reqBody?.reasoning?.effort
+          || reqBody?.reasoning_effort
+          || ""
+        ).trim().toLowerCase();
+
+        // gemini-3.8-flash-high is Codex's virtual model name.
+        // On daily-cloudcode-pa, gemini-3-flash is the primary model that supports function declarations and thought signatures.
+        if (antigravityModel === "gemini-3.8-flash-high") {
+          antigravityModel = "gemini-3-flash";
+        }
+
         finalPayloadBody = {
           project: "default-cli-project",
-          model: upstreamModel,
+          model: antigravityModel,
           request: geminiPayload
         };
       }
@@ -1917,7 +1941,7 @@ export class GatewayRouter {
         upstreamModel,
         sessionId,
         !isSubagentRequest,
-        adapterName,
+        effectiveAdapterName,
         providerReasoningContent,
       );
       const nextOptimized = await optimizeThirdPartyComputerUseImages(nextChatBody);
@@ -2043,7 +2067,7 @@ export class GatewayRouter {
     res.socket?.setNoDelay(true);
 
     const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(new DOMException("Provider turn timeout", "TimeoutError")), 600000);
+    const timeoutId = setTimeout(() => controller.abort(new DOMException("Provider turn timeout", "TimeoutError")), PROVIDER_TURN_TIMEOUT_MS);
     timeoutId.unref?.();
     const unlinkParentAbort = linkAbortSignal(requestSignal, controller);
     const writeSse = async (payload: any) => {
@@ -2421,7 +2445,7 @@ export class GatewayRouter {
       const decoder = new TextDecoder();
       let buffer = "";
 
-      const readWithTimeout = (timeoutMs = 600000): Promise<ReadableStreamReadResult<Uint8Array>> =>
+      const readWithTimeout = (timeoutMs = PROVIDER_TURN_TIMEOUT_MS): Promise<ReadableStreamReadResult<Uint8Array>> =>
         readWithAbortAndTimeout(
           () => reader.read(),
           controller.signal,
@@ -2479,7 +2503,7 @@ export class GatewayRouter {
                   ? CURSOR_TOOL_IDLE_TIMEOUT_MS
                   : cursorHasVisibleText
                     ? CURSOR_TEXT_IDLE_TIMEOUT_MS
-                    : 600000,
+                    : PROVIDER_TURN_TIMEOUT_MS,
             );
           } catch (readErr: any) {
             if (cursorToolResult && !cursorHasPostToolText) {

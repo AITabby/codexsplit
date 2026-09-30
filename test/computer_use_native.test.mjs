@@ -295,6 +295,51 @@ test("Gemini adapter exposes and restores the native Computer Use function call"
   assert.equal(chunks[0]?.choices?.[0]?.delta?.tool_calls?.[0]?.thought_signature, thoughtSignature);
 });
 
+test("Gemini adapter preserves thoughtSignature across stream chunks and emits thought as reasoning", () => {
+  const adapter = new GoogleGeminiAdapter();
+  const sig = "sig-chunk-carryover-123";
+
+  // Chunk 1: Thought text with thoughtSignature on part
+  const chunk1 = adapter.processStreamChunk({
+    candidates: [{
+      content: {
+        parts: [{ text: "Thinking about the next command...", thought: true, thoughtSignature: sig }]
+      }
+    }]
+  });
+  assert.equal(chunk1[0]?.choices?.[0]?.delta?.reasoning_content, "Thinking about the next command...");
+
+  // Chunk 2: Function call without inline signature (inherits from chunk 1)
+  const chunk2 = adapter.processStreamChunk({
+    candidates: [{
+      content: {
+        parts: [{ functionCall: { name: "exec_command", args: { cmd: "ls" } } }]
+      }
+    }]
+  });
+  const toolCall = chunk2[0]?.choices?.[0]?.delta?.tool_calls?.[0];
+  assert.equal(toolCall?.function?.name, "exec_command");
+  assert.equal(toolCall?.thought_signature, sig);
+
+  // Subsequent turn: adapter.transformPayload should rehydrate the thoughtSignature
+  const payload = adapter.transformPayload({
+    model: "antigravity/gemini-3.8-flash-high",
+    messages: [
+      { role: "user", content: "列出文件" },
+      {
+        role: "assistant",
+        content: "",
+        tool_calls: [toolCall],
+      },
+      { role: "tool", tool_call_id: toolCall.id, content: "file1.txt\nfile2.txt" },
+    ],
+  }).body;
+
+  assert.equal(payload.contents?.[1]?.parts?.[0]?.thoughtSignature, sig);
+  assert.equal(payload.contents?.[1]?.parts?.[0]?.functionCall?.name, "exec_command");
+  assert.equal(payload.contents?.[2]?.parts?.[0]?.functionResponse?.name, "exec_command");
+});
+
 test("Gemini adapter drops an orphaned terminal model turn without inventing a prompt", () => {
   const adapter = new GoogleGeminiAdapter();
   const payload = adapter.transformPayload({
@@ -558,4 +603,91 @@ test("Gemini Computer Use preserves thought signature and Accessibility Tree acr
   assert.equal(inlineImgPart.inlineData.mimeType, "image/jpeg");
   assert.equal(inlineImgPart.inlineData.data, "dGVzdF9zY3JlZW5zaG90");
 });
+
+test("capThirdPartyChatHistory never starts with an orphaned tool message and aligns to user turn", async () => {
+  const { capThirdPartyChatHistory } = await import("../dist/core/transformer.js");
+
+  // Create a conversation with multiple turns:
+  // Turn 1: user -> assistant(tool_call) -> tool
+  // Turn 2: user -> assistant(tool_call) -> tool
+  // Turn 3: user -> assistant(tool_call) -> tool
+  const messages = [
+    { role: "user", content: "turn 1 prompt" },
+    { role: "assistant", content: "", tool_calls: [{ id: "c1", function: { name: "exec_command", arguments: "{}" } }] },
+    { role: "tool", tool_call_id: "c1", name: "exec_command", content: "output 1" },
+    { role: "user", content: "turn 2 prompt" },
+    { role: "assistant", content: "", tool_calls: [{ id: "c2", function: { name: "exec_command", arguments: "{}" } }] },
+    { role: "tool", tool_call_id: "c2", name: "exec_command", content: "output 2" },
+    { role: "user", content: "turn 3 prompt" },
+    { role: "assistant", content: "", tool_calls: [{ id: "c3", function: { name: "exec_command", arguments: "{}" } }] },
+    { role: "tool", tool_call_id: "c3", name: "exec_command", content: "output 3" },
+  ];
+
+  // Window size of 4 would land on index 5 (messages.length 9 - 4 = 5), which is a `tool` message!
+  const result = capThirdPartyChatHistory(messages, "google", 4);
+  assert.ok(result.dropped > 0, "Should have dropped messages");
+  // The first kept message (after the system note at index 0) must NOT be a tool message
+  const keptMessages = result.messages.slice(1);
+  assert.notEqual(keptMessages[0].role, "tool", "First kept message must NEVER be a tool message");
+  assert.equal(keptMessages[0].role, "user", "Should align cleanly to a user turn");
+});
+
+test("GoogleGeminiAdapter strictly guarantees functionResponse turn comes immediately after functionCall turn", () => {
+  const adapter = new GoogleGeminiAdapter();
+
+  // Test case 1: Orphaned tool message with no preceding assistant functionCall
+  const orphanedChatBody = {
+    model: "gemini-3.8-flash-high",
+    messages: [
+      { role: "system", content: "System instructions" },
+      { role: "system", content: "[CodexSplit Bridge] Dropped 10 messages" },
+      { role: "tool", tool_call_id: "orphan_call_1", name: "exec_command", content: "command result" },
+      { role: "user", content: "User follow-up prompt" },
+    ],
+  };
+
+  const payload1 = adapter.transformPayload(orphanedChatBody).body;
+  // Multiple system messages must be preserved
+  assert.ok(payload1.systemInstruction.parts[0].text.includes("System instructions"));
+  assert.ok(payload1.systemInstruction.parts[0].text.includes("CodexSplit Bridge"));
+
+  // No functionResponse should be present because there was no preceding model functionCall turn!
+  for (let i = 0; i < payload1.contents.length; i++) {
+    const turn = payload1.contents[i];
+    const frPart = turn.parts?.find((p) => p.functionResponse);
+    if (frPart) {
+      assert.ok(i > 0, "functionResponse cannot be in turn 0");
+      assert.equal(payload1.contents[i - 1].role, "model", "Turn before functionResponse must be model");
+      const hasFc = payload1.contents[i - 1].parts.some((p) => p.functionCall && p.functionCall.name === frPart.functionResponse.name);
+      assert.ok(hasFc, "Preceding model turn must contain matching functionCall");
+    }
+  }
+
+  // Test case 2: Valid functionCall with thought signature followed by functionResponse
+  const validSig = "valid_thought_sig_abc";
+  thoughtSignatureStore.set("call_valid_1", validSig);
+
+  const validChatBody = {
+    model: "gemini-3.8-flash-high",
+    messages: [
+      { role: "user", content: "list files" },
+      {
+        role: "assistant",
+        content: "",
+        tool_calls: [{ id: "call_valid_1", thought_signature: validSig, function: { name: "exec_command", arguments: '{"cmd":"ls"}' } }],
+      },
+      { role: "tool", tool_call_id: "call_valid_1", name: "exec_command", content: "file1.txt\nfile2.txt" },
+    ],
+  };
+
+  const payload2 = adapter.transformPayload(validChatBody).body;
+  assert.ok(payload2.contents.length >= 3);
+  const modelTurnIdx = payload2.contents.findIndex((c) => c.role === "model" && c.parts.some((p) => p.functionCall));
+  assert.ok(modelTurnIdx >= 0, "Model turn with functionCall must exist");
+  assert.equal(payload2.contents[modelTurnIdx + 1].role, "user", "Immediate next turn must be user");
+  const fr = payload2.contents[modelTurnIdx + 1].parts.find((p) => p.functionResponse);
+  assert.ok(fr, "Matching functionResponse must exist immediately after model turn");
+  assert.equal(fr.functionResponse.name, "exec_command");
+});
+
 

@@ -22,7 +22,7 @@ import { fetchCursorModels } from "../services/cursor_protocol.js";
 import { getAntigravityUserAgent, getClaudeDesktopVersion, getCursorClientVersion, getGrokUserAgent } from "../services/subscription_auth.js";
 import { copyNativeRequestHeaders, handleWebRtcProxy, normalizeNativeLiveCallBody, readNativeAccountCredential, resolveRealtimeUpstream } from "./webrtc_proxy.js";
 import { ProviderConfig, ProviderModelTestState } from "../core/types.js";
-import { isNativeResponsesReasoningId } from "../core/responses_safety.js";
+import { isNativeResponsesReasoningId, sanitizeNativeResponsesBody } from "../core/responses_safety.js";
 import { closeUpstreamDispatcher, fetchUpstream, upstreamErrorDetails } from "../services/upstream_fetch.js";
 import { LIVE_MODEL_BINDING_TTL_MS, extractLiveModelIntent, isLikelyLiveModelIntentRequest, isLikelyLiveWorkRequest, isLiveModelEntryVisible, isToolContinuation, liveModelSessionKey, normalizeRealtimeWorkModel, orderOfficialModelsFirst } from "../services/live_model_picker.js";
 import { copySafeResponseHeaders, writeHttpResponseChunked, writeSseData } from "../services/http_stream.js";
@@ -488,7 +488,7 @@ export function buildManagedCodexConfig(
   // making the gateway the global default hides native history whenever the
   // Desktop client is not yet attached to the bridge.
   const managedTop = `# >>> opencodex managed >>>\nmodel_catalog_json = "${catalogPath}"\nmodel_provider = "openai"\ncheck_for_update_on_startup = false\n# <<< opencodex managed >>>\n`;
-  const managedProvider = `\n# >>> opencodex managed >>>\n[model_providers.opencodex]\nname = "CodexSplit"\nbase_url = "http://127.0.0.1:${port}/v1"\nwire_api = "responses"\nrequires_openai_auth = true\nexperimental_bearer_token = "${adminToken}"\nrequest_max_retries = 3\nstream_max_retries = 3\nstream_idle_timeout_ms = 600000\n# <<< opencodex managed >>>\n`;
+  const managedProvider = `\n# >>> opencodex managed >>>\n[model_providers.opencodex]\nname = "CodexSplit"\nbase_url = "http://127.0.0.1:${port}/v1"\nwire_api = "responses"\nrequires_openai_auth = true\nexperimental_bearer_token = "${adminToken}"\nrequest_max_retries = 3\nstream_max_retries = 3\nstream_idle_timeout_ms = 1800000\n# <<< opencodex managed >>>\n`;
   return `${managedTop}\n${preserved}\n${managedProvider}`;
 }
 
@@ -827,14 +827,30 @@ function providerBridgePath(): string {
   }) || "";
 }
 
-function nativeCodexExecutablePath(): string {
+export function nativeCodexExecutablePath(): string {
   const configured = String(process.env.OPENCODEX_NATIVE_CODEX_PATH || "").trim();
   const candidates = [
     configured,
+    "/Applications/ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex",
+    "/Applications/ChatGPT.app/Contents/Resources/codex-cli/bin/codex",
     "/Applications/ChatGPT.app/Contents/Resources/codex",
+    "/Applications/Codex.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex",
+    "/Applications/Codex.app/Contents/Resources/codex-cli/bin/codex",
     "/Applications/Codex.app/Contents/Resources/codex",
   ].filter(Boolean);
   return candidates.find((candidate) => fs.existsSync(candidate) && fs.statSync(candidate).isFile()) || "";
+}
+
+function ensureNativeCodexCompatibilitySymlink(): void {
+  if (process.platform !== "darwin") return;
+  try {
+    const legacyPath = "/Applications/ChatGPT.app/Contents/Resources/codex";
+    const newTarget = "codex-cli/CodexCLI.app/Contents/MacOS/codex";
+    const absoluteNewTarget = "/Applications/ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex";
+    if (!fs.existsSync(legacyPath) && fs.existsSync(absoluteNewTarget)) {
+      fs.symlinkSync(newTarget, legacyPath);
+    }
+  } catch {}
 }
 
 function ensureCliBridgeSymlink(): void {
@@ -958,7 +974,7 @@ function desktopAppServerState(): DesktopAppServerState {
     return "bridge";
   } catch {}
   try {
-    execFileSync("pgrep", ["-f", "/Applications/(ChatGPT|Codex)\\.app/Contents/Resources/codex.*app-server"], { stdio: "ignore" });
+    execFileSync("pgrep", ["-f", "/Applications/(ChatGPT|Codex)\\.app/Contents/Resources/.*codex.*app-server"], { stdio: "ignore" });
     return "native";
   } catch {}
   return "absent";
@@ -3745,11 +3761,17 @@ export class CodexBridgeServer {
       ? nativeResponsesEndpoint
       : `${nativeResponsesEndpoint}/${String(endpoint).replace(/^responses\/?/i, "")}`;
     const forwardHeaders = copyNativeRequestHeaders(req, { localAdminToken: this.adminToken }, true);
-    const requestBody = Buffer.isBuffer(body)
-      ? body
-      : typeof body === "string"
-        ? body
-        : JSON.stringify(body);
+    let parsedBody: any = body;
+    if (Buffer.isBuffer(body)) {
+      try { parsedBody = JSON.parse(body.toString("utf-8")); } catch {}
+    } else if (typeof body === "string") {
+      try { parsedBody = JSON.parse(body); } catch {}
+    }
+    if (parsedBody && typeof parsedBody === "object") {
+      const sanitized = sanitizeNativeResponsesBody(parsedBody);
+      parsedBody = sanitized.body;
+    }
+    const requestBody = typeof parsedBody === "string" ? parsedBody : JSON.stringify(parsedBody);
     const localAbort = requestSignal ? null : bindRequestResponseAbort(req, res);
     const effectiveSignal = requestSignal || localAbort?.signal;
 
@@ -4397,8 +4419,10 @@ export class CodexBridgeServer {
       delayedCatalogSync.unref?.();
     }
     ensureCliBridgeSymlink();
+    ensureNativeCodexCompatibilitySymlink();
     const cliBridgeTimer = setInterval(() => {
       ensureCliBridgeSymlink();
+      ensureNativeCodexCompatibilitySymlink();
     }, 60000);
     cliBridgeTimer.unref?.();
     // Desktop launch mode is an explicit user action. Starting or restarting
@@ -8880,7 +8904,8 @@ export class CodexBridgeServer {
     if (this.mcpProcess) return;
     console.error("[OpenCodex MCP Manager] Starting persistent codex mcp-server...");
 
-    this.mcpProcess = spawn("/Applications/ChatGPT.app/Contents/Resources/codex", ["mcp-server"]);
+    const nativeCodex = nativeCodexExecutablePath() || "/Applications/ChatGPT.app/Contents/Resources/codex";
+    this.mcpProcess = spawn(nativeCodex, ["mcp-server"]);
     this.mcpStdoutBuffer = "";
 
     this.mcpProcess.stdout.on("data", (chunk: Buffer) => {

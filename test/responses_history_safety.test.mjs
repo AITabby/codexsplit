@@ -12,11 +12,12 @@ test("native Responses history removes third-party reasoning IDs", () => {
     input: [
       { type: "message", role: "user", content: [{ type: "input_text", text: "hello" }] },
       { type: "reasoning", id: "06bc3676e18a741e9725169e350f4835_rs", summary: [] },
+      { type: "reasoning", id: "rs_gateway_third_party", encrypted_content: null, summary: [] },
       { type: "reasoning", id: "rs_0123456789abcdef", encrypted_content: "native" },
     ],
   });
 
-  assert.equal(result.removedReasoningItems, 1);
+  assert.equal(result.removedReasoningItems, 2);
   assert.equal(result.removedPreviousResponseId, true);
   assert.equal(result.body.input.length, 2);
   assert.equal(result.body.input[1].id, "rs_0123456789abcdef");

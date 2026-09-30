@@ -128,7 +128,10 @@ function readGrokSession(homeDir = defaultGrokAuthDir()): { authData: Record<str
   }
 }
 
-function readAntigravityAuth(profileDir?: string): AntigravityAuth | null {
+let cachedAntigravityAuth: { auth: AntigravityAuth; cachedAt: number } | null = null;
+const ANTIGRAVITY_AUTH_CACHE_TTL_MS = 60_000;
+
+function readAntigravityAuth(profileDir?: string, skipCache = false): AntigravityAuth | null {
   if (profileDir) {
     try {
       const filePath = path.join(profileDir, "auth.json");
@@ -139,6 +142,9 @@ function readAntigravityAuth(profileDir?: string): AntigravityAuth | null {
     }
   }
   if (process.platform !== "darwin") return null;
+  if (!skipCache && cachedAntigravityAuth && Date.now() - cachedAntigravityAuth.cachedAt < ANTIGRAVITY_AUTH_CACHE_TTL_MS) {
+    return cachedAntigravityAuth.auth;
+  }
   try {
     const raw = execFileSync("security", [
       "find-generic-password",
@@ -148,7 +154,9 @@ function readAntigravityAuth(profileDir?: string): AntigravityAuth | null {
     ], { encoding: "utf-8" }).trim();
     if (!raw.startsWith(ANTIGRAVITY_KEYCHAIN_PREFIX)) return null;
     const encoded = raw.slice(ANTIGRAVITY_KEYCHAIN_PREFIX.length);
-    return JSON.parse(Buffer.from(encoded, "base64").toString("utf-8")) as AntigravityAuth;
+    const auth = JSON.parse(Buffer.from(encoded, "base64").toString("utf-8")) as AntigravityAuth;
+    cachedAntigravityAuth = { auth, cachedAt: Date.now() };
+    return auth;
   } catch {
     return null;
   }
@@ -564,8 +572,11 @@ export function buildAntigravityUserAgent(
   return `antigravity/hub/${normalizedVersion} ${normalizedPlatform}/${normalizedArch}`;
 }
 
+let cachedAntigravityUserAgent: string | null = null;
 export function getAntigravityUserAgent(): string | null {
-  return buildAntigravityUserAgent(getAntigravityClientVersion());
+  if (cachedAntigravityUserAgent) return cachedAntigravityUserAgent;
+  cachedAntigravityUserAgent = buildAntigravityUserAgent(getAntigravityClientVersion());
+  return cachedAntigravityUserAgent;
 }
 
 function jwtExpiry(token: string): number | null {
@@ -609,6 +620,7 @@ function writeAntigravityAuth(auth: AntigravityAuth, profileDir?: string): void 
     writeJsonSecure(path.join(profileDir, "auth.json"), auth);
     return;
   }
+  cachedAntigravityAuth = { auth, cachedAt: Date.now() };
   const raw = `${ANTIGRAVITY_KEYCHAIN_PREFIX}${Buffer.from(JSON.stringify(auth), "utf-8").toString("base64")}`;
   execFileSync("security", [
     "add-generic-password",
@@ -789,7 +801,7 @@ export class SubscriptionAuthService {
 
   public static async getAntigravityAccessToken(forceRefresh = false): Promise<string | null> {
     const profileDir = this.selectProfile("antigravity");
-    const auth = readAntigravityAuth(profileDir || undefined) || (profileDir ? null : readAntigravityAuth());
+    const auth = readAntigravityAuth(profileDir || undefined, forceRefresh) || (profileDir ? null : readAntigravityAuth(undefined, forceRefresh));
     const token = auth?.token;
     if (token) {
       const accessToken = token.access_token || "";
@@ -814,7 +826,7 @@ export class SubscriptionAuthService {
     // refresh, fall back to the native system Keychain credentials. When the
     // Keychain has a valid login, heal the profile with it.
     if (profileDir) {
-      const keychainAuth = readAntigravityAuth();
+      const keychainAuth = readAntigravityAuth(undefined, forceRefresh);
       const kcToken = keychainAuth?.token;
       if (kcToken) {
         const kcAccessToken = kcToken.access_token || "";
@@ -826,7 +838,7 @@ export class SubscriptionAuthService {
         const kcRefreshed = await this.refreshAntigravityToken(undefined);
         if (kcRefreshed) {
           try {
-            const updated = readAntigravityAuth();
+            const updated = readAntigravityAuth(undefined, true);
             if (updated) writeAntigravityAuth(updated, profileDir);
           } catch {}
           return kcRefreshed;

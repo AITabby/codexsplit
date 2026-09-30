@@ -435,6 +435,7 @@ export class ResponsesStreamEngine {
   }
 
   private async openReasoning(writeSse: (payload: any) => Promise<void>): Promise<ReasoningState> {
+    if (this.reasoningState) return this.reasoningState;
     const emit = this.wrap(writeSse);
     const state: ReasoningState = {
       id: generateHexId("rs", 16),
@@ -469,16 +470,60 @@ export class ResponsesStreamEngine {
   }
 
   private async emitReasoningDelta(writeSse: (payload: any) => Promise<void>, text: string): Promise<void> {
-    // Never expose third-party chain-of-thought as a Responses reasoning item.
-    // In particular, do not allocate an `rs_*` id here: Codex Desktop may
-    // persist that item and replay it against chatgpt.com, where it does not
-    // exist because the gateway cannot store it upstream.
-    void writeSse;
-    if (text) this.providerReasoningContent += text;
+    if (!text) return;
+    this.providerReasoningContent += text;
+
+    if (!this.reasoningState) {
+      await this.openReasoning(writeSse);
+    }
+    const state = this.reasoningState!;
+    if (state.closed) return;
+
+    state.text += text;
+    const emit = this.wrap(writeSse);
+    await emit({
+      type: "response.reasoning_text.delta",
+      item_id: state.id,
+      output_index: state.output_index,
+      content_index: 0,
+      delta: text,
+    });
   }
 
   private async closeReasoning(writeSse: (payload: any) => Promise<void>): Promise<void> {
-    void writeSse;
+    if (!this.reasoningState || this.reasoningState.closed) return;
+    const state = this.reasoningState;
+    state.closed = true;
+    const emit = this.wrap(writeSse);
+
+    await emit({
+      type: "response.reasoning_text.done",
+      item_id: state.id,
+      output_index: state.output_index,
+      content_index: 0,
+      text: state.text,
+    });
+
+    await emit({
+      type: "response.content_part.done",
+      item_id: state.id,
+      output_index: state.output_index,
+      content_index: 0,
+      part: { type: "reasoning_text", text: state.text },
+    });
+
+    await emit({
+      type: "response.output_item.done",
+      output_index: state.output_index,
+      item: {
+        id: state.id,
+        type: "reasoning",
+        status: "completed",
+        summary: [],
+        content: [{ type: "reasoning_text", text: state.text }],
+        encrypted_content: null,
+      },
+    });
   }
 
   private async openMessage(writeSse: (payload: any) => Promise<void>): Promise<void> {
@@ -756,7 +801,12 @@ export class ResponsesStreamEngine {
     }
 
     if (!hasTools && !hasImages && (!this.messageText || this.messageText.trim().length === 0)) {
-      if (!this.messageOpened) {
+      if (this.providerReasoningContent && this.providerReasoningContent.trim().length > 0) {
+        if (!this.messageOpened) {
+          await this.openMessage(emit);
+        }
+        await this.emitTextDelta(emit, this.providerReasoningContent.trim());
+      } else if (!this.messageOpened) {
         await this.openMessage(emit);
       }
     }
@@ -863,40 +913,64 @@ export class ResponsesStreamEngine {
     }
 
     const now = Math.floor(Date.now() / 1000);
-    const output: any[] = [];
+    const outputCollected: Array<{ index: number; item: any }> = [];
+    if (this.reasoningState) {
+      outputCollected.push({
+        index: this.reasoningState.output_index,
+        item: {
+          id: this.reasoningState.id,
+          type: "reasoning",
+          status: "completed",
+          summary: [],
+          content: [{ type: "reasoning_text", text: this.reasoningState.text }],
+          encrypted_content: null,
+        },
+      });
+    }
     if (this.messageOpened) {
-      output.push({
-        id: this.messageItemId,
-        type: "message",
-        status: "completed",
-        role: "assistant",
-        phase: messagePhase,
-        content: [{ type: "output_text", text: this.messageText, annotations: [] }],
+      outputCollected.push({
+        index: this.messageIndex ?? 0,
+        item: {
+          id: this.messageItemId,
+          type: "message",
+          status: "completed",
+          role: "assistant",
+          phase: messagePhase,
+          content: [{ type: "output_text", text: this.messageText, annotations: [] }],
+        },
       });
     }
     for (const state of Object.values(this.toolCalls)) {
-      output.push({
-        id: state.id,
-        type: "function_call",
-        status: "completed",
-        call_id: state.call_id,
-        name: state.name,
-        arguments: state.arguments,
-        ...(state.namespace ? { namespace: state.namespace } : {}),
-        ...(state.thought_signature
-          ? { thought_signature: state.thought_signature, thoughtSignature: state.thought_signature }
-          : {}),
+      outputCollected.push({
+        index: state.output_index,
+        item: {
+          id: state.id,
+          type: "function_call",
+          status: "completed",
+          call_id: state.call_id,
+          name: state.name,
+          arguments: state.arguments,
+          ...(state.namespace ? { namespace: state.namespace } : {}),
+          ...(state.thought_signature
+            ? { thought_signature: state.thought_signature, thoughtSignature: state.thought_signature }
+            : {}),
+        },
       });
     }
     for (const image of this.imageGenerations) {
-      output.push({
-        id: image.id,
-        type: "image_generation_call",
-        status: "completed",
-        ...(image.revised_prompt ? { revised_prompt: image.revised_prompt } : {}),
-        result: image.result,
+      outputCollected.push({
+        index: image.output_index,
+        item: {
+          id: image.id,
+          type: "image_generation_call",
+          status: "completed",
+          ...(image.revised_prompt ? { revised_prompt: image.revised_prompt } : {}),
+          result: image.result,
+        },
       });
     }
+    outputCollected.sort((a, b) => a.index - b.index);
+    const output = outputCollected.map((entry) => entry.item);
     const completedResponse = {
       id: this.responseId,
       object: "response",

@@ -350,7 +350,11 @@ export function resolveNativeCodexPath(): string {
   const candidates = [
     ...configured,
     path.join(os.homedir(), ".codex", "packages", "standalone", "current", "bin", "codex"),
+    "/Applications/ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex",
+    "/Applications/ChatGPT.app/Contents/Resources/codex-cli/bin/codex",
     "/Applications/ChatGPT.app/Contents/Resources/codex",
+    "/Applications/Codex.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex",
+    "/Applications/Codex.app/Contents/Resources/codex-cli/bin/codex",
     "/Applications/Codex.app/Contents/Resources/codex",
   ];
   return candidates.find(executableFile) || candidates[0] || "codex";

@@ -128,6 +128,7 @@ function appendLegacyToolImages(parts: any[], content: any): void {
 
 export class GoogleGeminiAdapter implements ProtocolAdapter {
   public name = "google";
+  private pendingThoughtSignature: string | null = null;
 
   public sanitizeMessages(messages: ChatMessage[]): ChatMessage[] {
     return messages;
@@ -150,70 +151,92 @@ export class GoogleGeminiAdapter implements ProtocolAdapter {
       }
     }
 
+    let activeModelTurnCalls: Set<string> | null = null;
+
     for (const msg of chatBody.messages) {
       if (msg.role === "system") {
-        systemInstruction = {
-          parts: [{ text: typeof msg.content === "string" ? msg.content : "" }]
-        };
+        const text = typeof msg.content === "string" ? msg.content : "";
+        if (!text.trim()) continue;
+        if (!systemInstruction) {
+          systemInstruction = {
+            parts: [{ text }]
+          };
+        } else {
+          systemInstruction.parts[0].text += `\n\n${text}`;
+        }
         continue;
       }
 
-      const role = msg.role === "assistant" ? "model" : "user";
-      const parts: any[] = [];
+      if (msg.role === "user") {
+        activeModelTurnCalls = null;
+        const parts: any[] = [];
+        appendGeminiContentParts(parts, msg.content);
+        if (parts.length > 0) {
+          rawContents.push({ role: "user", parts });
+        }
+        continue;
+      }
 
-      if (msg.role !== "tool") appendGeminiContentParts(parts, msg.content);
+      if (msg.role === "assistant") {
+        const parts: any[] = [];
+        if (msg.content) appendGeminiContentParts(parts, msg.content);
+        const emittedCallNames = new Set<string>();
 
-      if (msg.tool_calls && Array.isArray(msg.tool_calls)) {
-        for (const tc of msg.tool_calls) {
-          let args = {};
-          try { args = JSON.parse(tc.function.arguments || "{}"); } catch {}
-          const sig = toolCallThoughtSignature(tc);
-          if (!sig) {
-            // A previous native Responses rollout may not have persisted the
-            // provider-owned signature. Never invent one: Gemini rejects a
-            // signatureless functionCall. Omit the stale call from provider
-            // history instead of turning internal tool data into plain text.
-            if (tc.id && tc.function?.name) toolNames.set(String(tc.id), String(tc.function.name));
-            continue;
-          }
-          const partObj: any = {
-            functionCall: {
-              name: tc.function.name,
-              args,
+        if (msg.tool_calls && Array.isArray(msg.tool_calls)) {
+          for (const tc of msg.tool_calls) {
+            let args = {};
+            try { args = JSON.parse(tc.function.arguments || "{}"); } catch {}
+            const sig = toolCallThoughtSignature(tc);
+            if (!sig) {
+              if (tc.id && tc.function?.name) toolNames.set(String(tc.id), String(tc.function.name));
+              continue;
             }
-          };
-          if (sig) {
+            const partObj: any = {
+              functionCall: {
+                name: tc.function.name,
+                args,
+              }
+            };
             partObj.thoughtSignature = sig;
             partObj.thought_signature = sig;
+            if (tc.id && tc.function?.name) toolNames.set(String(tc.id), String(tc.function.name));
+            if (tc.function?.name) emittedCallNames.add(String(tc.function.name));
+            parts.push(partObj);
           }
-          if (tc.id && tc.function?.name) toolNames.set(String(tc.id), String(tc.function.name));
-          parts.push(partObj);
         }
+
+        if (parts.length > 0) {
+          rawContents.push({ role: "model", parts });
+          activeModelTurnCalls = emittedCallNames.size > 0 ? emittedCallNames : null;
+        }
+        continue;
       }
 
       if (msg.role === "tool") {
+        const parts: any[] = [];
         const responseName = String(msg.name || toolNames.get(String(msg.tool_call_id || "")) || "exec_command").trim();
-        if (msg.tool_call_id && signaturelessToolCallIds.has(String(msg.tool_call_id))) {
-          // The matching call was omitted above because its Gemini thought
-          // signature is unrecoverable. A functionResponse without that call
-          // is also invalid, so preserve only screenshots and omit the
-          // textual result from the provider transcript.
-          appendLegacyToolImages(parts, msg.content);
-        } else {
+        const isSignatureless = Boolean(msg.tool_call_id && signaturelessToolCallIds.has(String(msg.tool_call_id)));
+        const hasPrecedingCall = activeModelTurnCalls !== null && activeModelTurnCalls.has(responseName);
+
+        if (hasPrecedingCall && !isSignatureless) {
           parts.push({
             functionResponse: {
               name: responseName,
               response: { output: extractToolTextOutput(msg.content) }
             }
           });
+        } else {
+          // A functionResponse without an immediately preceding functionCall turn
+          // violates Gemini's strict turn alternation and causes HTTP 400.
+          appendLegacyToolImages(parts, msg.content);
         }
         // A local Computer Use result carries the screenshot beside the
         // function response so Gemini can inspect the updated desktop.
         if (Array.isArray(msg.content)) appendGeminiContentParts(parts, msg.content.filter((part: any) => part?.type !== "text"));
-      }
 
-      if (parts.length > 0) {
-        rawContents.push({ role, parts });
+        if (parts.length > 0) {
+          rawContents.push({ role: "user", parts });
+        }
       }
     }
 
@@ -228,18 +251,59 @@ export class GoogleGeminiAdapter implements ProtocolAdapter {
     }
 
     if (mergedContents.length > 0 && mergedContents[0].role === "model") {
-      mergedContents.unshift({ role: "user", parts: [{ text: "Hello" }] });
+      mergedContents.unshift({ role: "user", parts: [{ text: "Continue the current task based on the preceding context and instructions." }] });
     }
 
     // Gemini's native endpoint rejects a request whose final turn is `model`.
-    // A trailing model turn here is an orphaned historical continuation: its
-    // tool result was not present, so sending invented user text would make
-    // the provider re-plan the same desktop action indefinitely. Drop only
-    // trailing model turns and let the current user/tool turn drive the next
-    // request.
     if (mergedContents.length > 0 && mergedContents[mergedContents.length - 1].role === "model") {
       while (mergedContents.length > 0 && mergedContents[mergedContents.length - 1].role === "model") {
         mergedContents.pop();
+      }
+    }
+
+    // Final defense-in-depth: Ensure Gemini invariant that every functionResponse
+    // is strictly in a `user` turn immediately following a `model` turn containing
+    // a matching functionCall.
+    for (let i = 0; i < mergedContents.length; i++) {
+      const item = mergedContents[i];
+      if (item.role === "user" && Array.isArray(item.parts)) {
+        const prevModel = i > 0 && mergedContents[i - 1]?.role === "model" ? mergedContents[i - 1] : null;
+        const availableCalls = new Set<string>();
+        if (prevModel && Array.isArray(prevModel.parts)) {
+          for (const p of prevModel.parts) {
+            if (p?.functionCall?.name) availableCalls.add(String(p.functionCall.name));
+          }
+        }
+        item.parts = item.parts.filter((p: any) => {
+          if (p?.functionResponse) {
+            const fnName = String(p.functionResponse.name || "");
+            return availableCalls.has(fnName);
+          }
+          return true;
+        });
+      }
+    }
+
+    let finalContents = mergedContents.filter((c: any) => c.parts && c.parts.length > 0);
+    if (finalContents.length === 0) {
+      finalContents = [{ role: "user", parts: [{ text: "Hello" }] }];
+    }
+    if (finalContents[0].role === "model") {
+      finalContents.unshift({ role: "user", parts: [{ text: "Hello" }] });
+    }
+    while (finalContents.length > 0 && finalContents[finalContents.length - 1].role === "model") {
+      finalContents.pop();
+    }
+    if (finalContents.length === 0) {
+      finalContents = [{ role: "user", parts: [{ text: "Hello" }] }];
+    }
+
+    const compactContents: any[] = [];
+    for (const item of finalContents) {
+      if (compactContents.length > 0 && compactContents[compactContents.length - 1].role === item.role) {
+        compactContents[compactContents.length - 1].parts.push(...item.parts);
+      } else {
+        compactContents.push({ role: item.role, parts: [...item.parts] });
       }
     }
 
@@ -253,10 +317,13 @@ export class GoogleGeminiAdapter implements ProtocolAdapter {
     });
 
     const geminiBody: any = {
-      contents: mergedContents,
+      contents: compactContents,
       generationConfig: {
         temperature: chatBody.temperature ?? 0.7,
-        maxOutputTokens: chatBody.max_tokens ?? 4096,
+        maxOutputTokens: chatBody.max_tokens ?? 65536,
+        thinkingConfig: {
+          includeThoughts: true,
+        },
       }
     };
 
@@ -276,20 +343,47 @@ export class GoogleGeminiAdapter implements ProtocolAdapter {
     if (!eventData || typeof eventData !== "object") return [];
     const chunks: any[] = [];
     const candidate = (eventData.response?.candidates || eventData.candidates || [])[0];
-    if (!candidate || !candidate.content) return chunks;
+    if (!candidate) return chunks;
 
-    const parts = candidate.content.parts || [];
+    const candidateSig = candidate.content?.thoughtSignature
+      || candidate.content?.thought_signature
+      || candidate.thoughtSignature
+      || candidate.thought_signature
+      || eventData.thoughtSignature
+      || eventData.response?.thoughtSignature;
+    if (typeof candidateSig === "string" && candidateSig.trim()) {
+      this.pendingThoughtSignature = candidateSig.trim();
+    }
+
+    const parts = candidate.content?.parts || [];
     for (let i = 0; i < parts.length; i++) {
       const part = parts[i];
+      const partSig = part.thoughtSignature || part.thought_signature;
+      if (typeof partSig === "string" && partSig.trim()) {
+        this.pendingThoughtSignature = partSig.trim();
+      }
+
       if (part.text) {
-        chunks.push({
-          choices: [{
-            delta: { content: part.text }
-          }]
-        });
+        if (part.thought === true) {
+          chunks.push({
+            choices: [{
+              delta: { reasoning_content: part.text }
+            }]
+          });
+        } else {
+          chunks.push({
+            choices: [{
+              delta: { content: part.text }
+            }]
+          });
+        }
       }
       if (part.functionCall) {
-        const sig = part.thoughtSignature || part.thought_signature || candidate.content?.thoughtSignature || candidate.content?.thought_signature;
+        const sig = part.thoughtSignature
+          || part.thought_signature
+          || this.pendingThoughtSignature
+          || candidate.content?.thoughtSignature
+          || candidate.content?.thought_signature;
         let argumentSize = 0;
         try {
           argumentSize = JSON.stringify(part.functionCall.args || {}).length;
@@ -322,6 +416,9 @@ export class GoogleGeminiAdapter implements ProtocolAdapter {
           }]
         });
       }
+    }
+    if (candidate.finishReason) {
+      this.pendingThoughtSignature = null;
     }
     return chunks;
   }

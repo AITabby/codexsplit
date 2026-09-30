@@ -1980,8 +1980,17 @@ export function normalizeThreadListParams(params: JsonRecord = {}): JsonRecord {
 }
 
 function nativeCodexPath(): string {
-  return cleanString(process.env.OPENCODEX_NATIVE_CODEX_PATH)
-    || "/Applications/ChatGPT.app/Contents/Resources/codex";
+  const configured = cleanString(process.env.OPENCODEX_NATIVE_CODEX_PATH);
+  if (configured && fs.existsSync(configured)) return configured;
+  const candidates = [
+    "/Applications/ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex",
+    "/Applications/ChatGPT.app/Contents/Resources/codex-cli/bin/codex",
+    "/Applications/ChatGPT.app/Contents/Resources/codex",
+    "/Applications/Codex.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex",
+    "/Applications/Codex.app/Contents/Resources/codex-cli/bin/codex",
+    "/Applications/Codex.app/Contents/Resources/codex",
+  ];
+  return candidates.find((c) => fs.existsSync(c)) || configured || "/Applications/ChatGPT.app/Contents/Resources/codex";
 }
 
 function nativeCliPath(): string {
@@ -1989,7 +1998,11 @@ function nativeCliPath(): string {
     cleanString(process.env.OPENCODEX_NATIVE_CLI_PATH),
     cleanString(process.env.OPENCODEX_NATIVE_CODEX_PATH),
     path.join(os.homedir(), ".codex", "packages", "standalone", "current", "bin", "codex"),
+    "/Applications/ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex",
+    "/Applications/ChatGPT.app/Contents/Resources/codex-cli/bin/codex",
     "/Applications/ChatGPT.app/Contents/Resources/codex",
+    "/Applications/Codex.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex",
+    "/Applications/Codex.app/Contents/Resources/codex-cli/bin/codex",
     "/Applications/Codex.app/Contents/Resources/codex",
   ].filter(Boolean);
   return candidates.find((candidate) => fs.existsSync(candidate) && fs.statSync(candidate).mode & 0o111) || nativeCodexPath();

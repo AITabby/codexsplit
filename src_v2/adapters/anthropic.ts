@@ -47,7 +47,10 @@ export class AnthropicAdapter implements ProtocolAdapter {
 
     for (const msg of chatBody.messages) {
       if (msg.role === "system") {
-        systemPrompt = typeof msg.content === "string" ? msg.content : "";
+        const text = typeof msg.content === "string" ? msg.content : "";
+        if (text.trim()) {
+          systemPrompt = systemPrompt ? `${systemPrompt}\n\n${text}` : text;
+        }
         continue;
       }
 

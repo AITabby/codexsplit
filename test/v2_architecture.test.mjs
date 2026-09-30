@@ -136,7 +136,7 @@ test("v2 stream engine retains provider reasoning privately for tool continuatio
 
   assert.equal(engine.getReasoningContent(), "provider-private-thinking");
   assert.deepEqual(engine.getToolCallIds(), ["call_question"]);
-  assert.equal(events.some((event) => event.type === "response.output_item.added" && event.item?.type === "reasoning"), false);
+  assert.equal(events.some((event) => event.type === "response.output_item.added" && event.item?.type === "reasoning"), true);
 });
 
 test("v2 Chat continuation restores reasoning_content for the matching provider call", async () => {
@@ -1077,7 +1077,7 @@ test("v2 adds desktop approval fields at the protocol boundary", () => {
   assert.equal(typeof normalized.justification, "string");
 });
 
-test("v2 stream engine keeps third-party reasoning internal and emits text", async () => {
+test("v2 stream engine streams reasoning deltas and emits text cleanly", async () => {
   const events = [];
   const engine = new ResponsesStreamEngine("mock-coder", "turn-123");
 
@@ -1091,11 +1091,11 @@ test("v2 stream engine keeps third-party reasoning internal and emits text", asy
   await engine.finish(async (evt) => events.push(evt));
 
   const textEvent = events.find((evt) => evt.type === "response.output_text.delta");
+  const reasoningDelta = events.find((evt) => evt.type === "response.reasoning_text.delta");
 
-  assert.equal(events.some((evt) => evt.type.startsWith("response.reasoning_")), false);
-  assert.equal(events.some((evt) => evt.item?.type === "reasoning"), false);
-  assert.equal(events.some((evt) => typeof evt.item?.id === "string" && evt.item.id.startsWith("rs_")), false);
-  assert.ok(textEvent);
+  assert.ok(reasoningDelta, "Reasoning delta should be emitted");
+  assert.equal(reasoningDelta.delta, "thinking deeply");
+  assert.ok(textEvent, "Output text delta should be emitted");
   assert.equal(textEvent.delta, "hello world");
 });
 

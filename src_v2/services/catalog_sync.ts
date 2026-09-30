@@ -11,7 +11,7 @@ import { ProviderConfig } from "../core/types.js";
 import { CredentialStore } from "./credential_store.js";
 import { NATIVE_COMPUTER_USE_SYSTEM_INSTRUCTIONS } from "./computer_use_native.js";
 
-import { codexConfigPath, codexHomeDir, opencodexDataDir, stripManagedCodexConfig, writePrivateTextFile } from "../server/gateway.js";
+import { codexConfigPath, codexHomeDir, opencodexDataDir, stripManagedCodexConfig, writePrivateTextFile, nativeCodexExecutablePath } from "../server/gateway.js";
 
 const DEFAULT_REASONING_PRESETS = [
   { effort: "low", description: "轻度推理（速度优先）" },
@@ -883,7 +883,8 @@ export class CatalogSyncService {
       const tempContent = stripManagedCodexConfig(backup);
       writePrivateTextFile(configPath, tempContent);
       try {
-        const raw = execFileSync("/Applications/ChatGPT.app/Contents/Resources/codex", ["debug", "models"], { stdio: ["ignore", "pipe", "ignore"] }).toString();
+        const codexExec = nativeCodexExecutablePath() || "/Applications/ChatGPT.app/Contents/Resources/codex";
+        const raw = execFileSync(codexExec, ["debug", "models"], { stdio: ["ignore", "pipe", "ignore"] }).toString();
         const json = JSON.parse(raw);
         return (json.models || [])
           .filter((m: any) => m.slug !== "codex-auto-review")

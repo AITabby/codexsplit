@@ -623,13 +623,24 @@ import { SessionHistoryService } from "../services/session_history.js";
  * (positive integer; `0` disables the cap). Native Codex GPT responses never
  * flow through this function, so the cap cannot affect that path.
  */
-export const THIRD_PARTY_HISTORY_WINDOW = (() => {
+export const DEFAULT_THIRD_PARTY_HISTORY_WINDOW = 32;
+export const GOOGLE_THIRD_PARTY_HISTORY_WINDOW = 256;
+
+export function getThirdPartyHistoryWindow(adapterName?: string): number {
   const raw = process.env.OPENCODEX_THIRD_PARTY_HISTORY_WINDOW;
-  if (raw === undefined || raw === "") return 32;
-  const parsed = Number(raw);
-  if (!Number.isFinite(parsed) || parsed < 0) return 32;
-  return Math.floor(parsed);
-})();
+  if (raw !== undefined && raw !== "") {
+    const parsed = Number(raw);
+    if (!Number.isFinite(parsed) || parsed < 0) return DEFAULT_THIRD_PARTY_HISTORY_WINDOW;
+    return Math.floor(parsed);
+  }
+  const norm = String(adapterName || "").toLowerCase().trim();
+  if (norm === "google" || norm === "gemini") {
+    return GOOGLE_THIRD_PARTY_HISTORY_WINDOW;
+  }
+  return DEFAULT_THIRD_PARTY_HISTORY_WINDOW;
+}
+
+export const THIRD_PARTY_HISTORY_WINDOW = getThirdPartyHistoryWindow();
 
 export interface CapThirdPartyHistoryResult {
   messages: ChatMessage[];
@@ -639,13 +650,76 @@ export interface CapThirdPartyHistoryResult {
 export function capThirdPartyChatHistory(
   messages: ChatMessage[],
   adapterName?: string,
-  windowSize: number = THIRD_PARTY_HISTORY_WINDOW,
+  windowSize?: number,
 ): CapThirdPartyHistoryResult {
-  if (windowSize <= 0) return { messages, dropped: 0 };
+  const effectiveWindow = typeof windowSize === "number" ? windowSize : getThirdPartyHistoryWindow(adapterName);
+  if (effectiveWindow <= 0) return { messages, dropped: 0 };
   if (!Array.isArray(messages)) return { messages, dropped: 0 };
-  if (messages.length <= windowSize) return { messages, dropped: 0 };
-  const dropped = messages.length - windowSize;
-  const kept = messages.slice(-windowSize);
+  if (messages.length <= effectiveWindow) return { messages, dropped: 0 };
+
+  const targetStartIndex = messages.length - effectiveWindow;
+  let cleanStartIndex = -1;
+
+  // 1. Try to find the closest `user` message boundary at or before targetStartIndex
+  //    provided it doesn't exceed effectiveWindow * 1.5
+  for (let i = targetStartIndex; i >= 0; i--) {
+    if (messages[i].role === "user") {
+      if (messages.length - i <= Math.max(effectiveWindow * 1.5, effectiveWindow + 10)) {
+        cleanStartIndex = i;
+      }
+      break;
+    }
+  }
+
+  // 2. If no user message was found within threshold before targetStartIndex,
+  //    search forward from targetStartIndex for the next `user` message.
+  if (cleanStartIndex < 0) {
+    for (let i = targetStartIndex + 1; i < messages.length; i++) {
+      if (messages[i].role === "user") {
+        cleanStartIndex = i;
+        break;
+      }
+    }
+  }
+
+  // 3. Fallback: if there is no user message anywhere near the window,
+  //    find the first `assistant` message with tool calls at or after targetStartIndex.
+  if (cleanStartIndex < 0) {
+    for (let i = targetStartIndex; i < messages.length; i++) {
+      if (messages[i].role === "assistant" && Array.isArray(messages[i].tool_calls) && messages[i].tool_calls.length > 0) {
+        cleanStartIndex = i;
+        break;
+      }
+    }
+  }
+
+  if (cleanStartIndex < 0) {
+    cleanStartIndex = targetStartIndex;
+  }
+
+  const kept = messages.slice(cleanStartIndex);
+
+  // Absolute safety: never start the kept slice with a `tool` role message!
+  while (kept.length > 0 && kept[0].role === "tool") {
+    kept.shift();
+  }
+
+  // Critical safeguard: if the kept slice contains no user message at all
+  // (e.g. during a long chain of tool executions for a single user turn),
+  // preserve the initiating user message from before cleanStartIndex so the
+  // downstream model retains context of what the user requested and what language they used!
+  if (!kept.some((m) => m.role === "user")) {
+    const initiatingUserMsg = [...messages.slice(0, cleanStartIndex)].reverse().find((m) => m.role === "user");
+    if (initiatingUserMsg) {
+      kept.unshift(initiatingUserMsg);
+    }
+  }
+
+  const dropped = messages.length - kept.length;
+  if (dropped <= 0) {
+    return { messages, dropped: 0 };
+  }
+
   const providerLabel = String(adapterName || "third-party").trim() || "third-party";
   const note: ChatMessage = {
     role: "system",
@@ -654,7 +728,7 @@ export function capThirdPartyChatHistory(
       + `before forwarding the request to the third-party provider "${providerLabel}". `
       + `Native GPT keeps prompt-cache discounts on long transcripts; third-party APIs do not, `
       + `so trimming here keeps input-token usage bounded for providers that bill every token. `
-      + `The remaining ${kept.length} messages below are the most recent ones in the local Codex session.`,
+      + `The initiating user instruction and the remaining ${kept.length} messages below are preserved from the local Codex session.`,
   };
   return { messages: [note, ...kept], dropped };
 }

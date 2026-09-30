@@ -14,7 +14,9 @@ export function sanitizeNativeResponsesBody(body: any): {
   if (Array.isArray(body?.input)) {
     sanitized.input = body.input.filter((item: any) => {
       if (item?.type !== "reasoning") return true;
-      const keep = isNativeResponsesReasoningId(item.id);
+      // Native ChatGPT reasoning items carry server-encrypted content.
+      // Gateway-generated reasoning items have encrypted_content == null.
+      const keep = isNativeResponsesReasoningId(item?.id) && item?.encrypted_content != null;
       if (!keep) removedReasoningItems++;
       return keep;
     });
