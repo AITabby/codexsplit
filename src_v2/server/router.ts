@@ -1851,6 +1851,8 @@ export class GatewayRouter {
         activeAdapter = new GoogleGeminiAdapter();
         const geminiPayload = activeAdapter.transformPayload(optimizedChatBody).body;
 
+        // Clean 1:1 passthrough: whatever model the user or client selected, pass that exact model upstream!
+        // No silent rewrites, no model swapping, no downgrades.
         let antigravityModel = upstreamModel;
         const requestedEffort = String(
           optimizedChatBody?.reasoning_effort
@@ -1859,11 +1861,8 @@ export class GatewayRouter {
           || ""
         ).trim().toLowerCase();
 
-        // Map reasoning effort to the appropriate Google Antigravity flash tier.
-        // Google daily-cloudcode-pa natively supports gemini-3.8-flash-low (TTFB ~2s),
-        // gemini-3.8-flash-medium (TTFB ~2.6s), and gemini-3.8-flash-high (TTFB ~2.6-8s).
-        // Never downgrade to legacy unoptimized gemini-3-flash which takes 15-18s upstream.
-        if (antigravityModel === "gemini-3.8-flash-high" || antigravityModel === "gemini-3-flash") {
+        // Only if the user selected a bare untiered "gemini-3.8-flash", resolve tier from reasoning effort:
+        if (antigravityModel === "gemini-3.8-flash") {
           if (requestedEffort === "low") {
             antigravityModel = "gemini-3.8-flash-low";
           } else if (requestedEffort === "medium") {
