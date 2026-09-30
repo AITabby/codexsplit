@@ -1027,21 +1027,25 @@ async function notifyGatewayLiveClosed(callId = ""): Promise<void> {
 
 function nativeEgressPath(pathname: string, basePath = "/v1"): string {
   const pathValue = pathname || "/";
+  let subPath = pathValue;
   if (basePath !== "/v1") {
     if (pathValue === basePath) return "/";
     if (pathValue.startsWith(`${basePath}/`)) {
-      const relativePath = pathValue.slice(basePath.length);
-      // A runtime may append the conventional /v1 prefix even when the
-      // configured override already ends in /v1. Both spellings target the
-      // same local egress endpoint.
-      if (relativePath === "/v1") return "/";
-      if (relativePath.startsWith("/v1/")) return relativePath.slice(3);
-      return relativePath;
+      subPath = pathValue.slice(basePath.length);
+    } else if (pathValue.startsWith("/backend-api/")) {
+      subPath = pathValue;
+    } else {
+      return "";
     }
-    return "";
   }
-  if (pathValue === "/v1" || pathValue === "/") return "/";
-  return pathValue.startsWith("/v1/") ? pathValue.slice(3) : (pathValue.startsWith("/") ? pathValue : `/${pathValue}`);
+  if (subPath === "/v1" || subPath === "/") return "/";
+  if (subPath.startsWith("/v1/")) subPath = subPath.slice(3);
+  if (subPath.startsWith("/backend-api/codex/")) {
+    const relative = subPath.slice("/backend-api/codex".length);
+    return relative === "" ? "/" : relative;
+  }
+  if (subPath === "/backend-api/codex") return "/";
+  return subPath.startsWith("/") ? subPath : `/${subPath}`;
 }
 
 /**
@@ -1055,7 +1059,10 @@ export function isNativeLiveCreateCall(pathname: string, basePath = "/v1"): bool
 
 function nativeUpstreamTarget(pathname: string, search: string, basePath: string): string {
   const nativeBase = cleanString(process.env.OPENCODEX_NATIVE_UPSTREAM_BASE_URL).replace(/\/$/, "");
-  const pathValue = `/backend-api/codex${nativeEgressPath(pathname, basePath)}`;
+  const egressPath = nativeEgressPath(pathname, basePath);
+  const pathValue = egressPath.startsWith("/backend-api/")
+    ? egressPath
+    : `/backend-api/codex${egressPath === "/" ? "" : egressPath}`;
   return `${nativeBase || "https://chatgpt.com"}${pathValue}${search}`;
 }
 
@@ -1282,14 +1289,16 @@ async function proxyNativeEgressRequest(
   const unlinkResponseAbort = linkAbortSignal(responseAbort.signal, requestController);
   try {
     let credential = accountRouter?.credentialForRequest(req) || null;
+    const method = req.method || "POST";
+    const isHeadOrGet = method === "GET" || method === "HEAD";
     while (true) {
       const prepared = requestPreparation?.prepareRequest
         ? requestPreparation.prepareRequest(credential)
         : { headers: localEgressHeaders(req, credential), body };
       const upstreamRes = await fetchUpstream(targetUrl, {
-        method: req.method || "POST",
+        method,
         headers: prepared.headers,
-        body: prepared.body as any,
+        body: isHeadOrGet ? undefined : (prepared.body as any),
         // Retry only pre-response connection failures. fetchUpstream returns as
         // soon as headers arrive, so streaming responses are never replayed.
         maxAttempts: requestPreparation?.maxAttempts ?? 3,
@@ -1402,19 +1411,13 @@ async function handleNativeEgressRequest(
     res.end(JSON.stringify({ error: "native egress route not found" }));
     return;
   }
-  const websocketRequest = req.method === "GET"
-    || req.headers.upgrade?.toLowerCase() === "websocket"
+  const websocketRequest = req.headers.upgrade?.toLowerCase() === "websocket"
     || (req.headers.connection || "").toLowerCase().includes("upgrade");
   if (websocketRequest) {
     writeNativeEgressFallback(res);
     return;
   }
-  if (req.method !== "POST") {
-    res.writeHead(405, { "Content-Type": "application/json", "Allow": "POST" });
-    res.end(JSON.stringify({ error: "native egress only accepts POST requests" }));
-    return;
-  }
-  const body = await readRequestBody(req);
+  const body = req.method === "GET" || req.method === "HEAD" ? Buffer.alloc(0) : await readRequestBody(req);
   let parsedBody: JsonRecord = {};
   try {
     const value = JSON.parse(body.toString("utf8"));
@@ -1863,6 +1866,7 @@ export function nativeRuntimeArgs(args: string[], egressPort: number, egressBase
     // Keep the legacy OpenAI base override too for child revisions that read
     // it before resolving the configured provider.
     "-c", `openai_base_url=${nativeEgressBaseUrl}`,
+    "-c", `chatgpt_base_url=${nativeEgressBaseUrl}/backend-api/`,
     // Live also crosses this Egress as a transparent native transport. The
     // HTTP call creation and WebSocket sideband have separate settings; the
     // latter must use ws:// so the runtime performs a real Upgrade instead of
@@ -1903,9 +1907,52 @@ function requestWithParams(message: JsonRecord, params: JsonRecord): JsonRecord 
   return { ...message, params };
 }
 
+const PROVIDER_FIELD_KEYS = [
+  "modelProvider",
+  "model_provider",
+  "modelProviderId",
+  "model_provider_id",
+  "modelProviderName",
+  "model_provider_name",
+];
+
 function stripRequestProvider(params: JsonRecord): JsonRecord {
   const next = { ...params };
-  delete next.modelProvider;
+  for (const key of PROVIDER_FIELD_KEYS) {
+    delete next[key];
+  }
+  for (const containerKey of ["threadSettings", "thread_settings", "settings"]) {
+    const container = next[containerKey];
+    if (container && typeof container === "object" && !Array.isArray(container)) {
+      const nextContainer = { ...(container as JsonRecord) };
+      for (const key of PROVIDER_FIELD_KEYS) {
+        delete nextContainer[key];
+      }
+      next[containerKey] = nextContainer;
+    }
+  }
+  return next;
+}
+
+export function applyRequestProvider(params: JsonRecord, provider: string): JsonRecord {
+  const stripped = stripRequestProvider(params);
+  const next: JsonRecord = {
+    ...stripped,
+    modelProvider: provider,
+    model_provider: provider,
+    model_provider_id: provider,
+  };
+  for (const containerKey of ["threadSettings", "thread_settings", "settings"]) {
+    const container = next[containerKey];
+    if (container && typeof container === "object" && !Array.isArray(container)) {
+      next[containerKey] = {
+        ...(container as JsonRecord),
+        modelProvider: provider,
+        model_provider: provider,
+        model_provider_id: provider,
+      };
+    }
+  }
   return next;
 }
 
@@ -2358,8 +2405,24 @@ async function runProviderBridge(): Promise<void> {
     return "";
   }
 
+  function modelFromPayload(params: JsonRecord): string {
+    if (!params || typeof params !== "object") return "";
+    const top = modelSlug(params.model);
+    if (top) return top;
+    const picker = collaborationModel(params);
+    if (picker) return picker;
+    for (const containerKey of ["threadSettings", "thread_settings", "settings"]) {
+      const container = params[containerKey];
+      if (container && typeof container === "object" && !Array.isArray(container)) {
+        const nestedModel = modelSlug((container as JsonRecord).model);
+        if (nestedModel) return nestedModel;
+      }
+    }
+    return "";
+  }
+
   function selectedModel(params: JsonRecord, route?: ThreadRoute): string {
-    return modelSlug(params.model) || route?.selectedModel || nativeDefaultModel();
+    return modelFromPayload(params) || route?.selectedModel || nativeDefaultModel();
   }
 
   function threadMetadata(params: JsonRecord): JsonRecord {
@@ -2435,14 +2498,9 @@ async function runProviderBridge(): Promise<void> {
   }
 
   function selectedTurnModel(params: JsonRecord, route: ThreadRoute): string {
-    // Desktop's current protocol puts the picker selection in
-    // collaborationMode.settings.model while leaving turn/start.model empty
-    // (or at the native physical GPT model). Use that field as the selected
-    // provider target; otherwise a fresh third-party conversation is silently
-    // rebound to the native GPT route created by thread/start.
-    const topLevel = modelSlug(params.model);
-    const pickerModel = collaborationModel(params);
-    const explicit = topLevel || pickerModel;
+    // Desktop and mobile remote protocols may provide the model in params.model,
+    // collaborationMode.settings.model, threadSettings.model, or settings.model.
+    const explicit = modelFromPayload(params);
     const pending = pendingSelectedModels.get(route.externalId);
     const explicitProvider = explicit ? providerForModel(explicit) : null;
     // A model change is committed by thread/settings/update. Desktop can
@@ -3370,15 +3428,16 @@ async function runProviderBridge(): Promise<void> {
         }
       } catch {}
     }
-    const nextParams = rewriteNativeTransportModel({
-      ...stripRequestProvider({
+    const nextParams = rewriteNativeTransportModel(
+      applyRequestProvider({
         ...originalParams,
         threadId: physicalThreadId,
         model: transportModel,
         ...(Object.keys(routedMetadata).length > 0 ? { client_metadata: routedMetadata } : {}),
-      }),
-      modelProvider: selectedProvider === GATEWAY_PROVIDER ? NATIVE_EGRESS_PROVIDER : NATIVE_PROVIDER,
-    }, transportModel, selectedProvider === GATEWAY_PROVIDER);
+      }, selectedProvider === GATEWAY_PROVIDER ? NATIVE_EGRESS_PROVIDER : NATIVE_PROVIDER),
+      transportModel,
+      selectedProvider === GATEWAY_PROVIDER,
+    );
     activeTurns.set(route.externalId, {
       provider: NATIVE_PROVIDER,
       physicalThreadId,
@@ -3588,18 +3647,18 @@ async function runProviderBridge(): Promise<void> {
     const physicalModel = providerForModel(selected) === NATIVE_PROVIDER ? selected : nativeDefaultModel();
     const thirdParty = providerForModel(selected) === GATEWAY_PROVIDER;
     const native = ensureRuntime(NATIVE_PROVIDER);
-    const nextParams = rewriteNativeTransportModel({
-      ...stripRequestProvider(params),
-      // Keep a provider-owned start durable in the native Codex store. The
-      // selected provider is request routing metadata; it is not a second
-      // app-server or a separate conversation record.
-      ...(thirdParty ? { ephemeral: false } : {}),
-      model: physicalModel,
-      // Keep every logical thread on the local OpenAI-compatible Egress. It
-      // routes official models to the native account and provider-owned models
-      // to the selected third-party gateway without splitting the thread.
-      modelProvider: NATIVE_EGRESS_PROVIDER,
-    }, physicalModel, thirdParty);
+    const nextParams = rewriteNativeTransportModel(
+      applyRequestProvider({
+        ...params,
+        // Keep a provider-owned start durable in the native Codex store. The
+        // selected provider is request routing metadata; it is not a second
+        // app-server or a separate conversation record.
+        ...(thirdParty ? { ephemeral: false } : {}),
+        model: physicalModel,
+      }, NATIVE_EGRESS_PROVIDER),
+      physicalModel,
+      thirdParty,
+    );
     sendParent(native, message, "thread/start", nextParams, {
       displayModel: selected,
       displayProvider: providerForModel(selected),
@@ -3610,6 +3669,16 @@ async function runProviderBridge(): Promise<void> {
           const thread = result.thread && typeof result.thread === "object" ? result.thread as JsonRecord : {};
           const nativeId = threadIdFrom(thread.id);
           if (nativeId) {
+            try {
+              const dbPath = path.join(codexHomeDir(), "state_5.sqlite");
+              if (fs.existsSync(dbPath)) {
+                const targetProvider = thirdParty ? "opencodex" : "openai";
+                execFileSync("sqlite3", [
+                  dbPath,
+                  `UPDATE threads SET model_provider = '${targetProvider}' WHERE id = '${nativeId}' AND model_provider != '${targetProvider}';`,
+                ], { stdio: "ignore" });
+              }
+            } catch {}
             const route = saveRoute({
               externalId: nativeId,
               nativeId,
@@ -3721,13 +3790,12 @@ async function runProviderBridge(): Promise<void> {
         });
       };
       const sendResume = (): void => {
-        const nextParams: JsonRecord = {
-          ...stripRequestProvider(params),
+        const nextParams: JsonRecord = applyRequestProvider({
           ...(route.settings || {}),
+          ...params,
           threadId: route.nativeId,
           model: nativeModel({}, route),
-          modelProvider: NATIVE_EGRESS_PROVIDER,
-        };
+        }, NATIVE_EGRESS_PROVIDER);
         delete nextParams.config;
         delete nextParams.path;
         if (route.nativePath) nextParams.path = route.nativePath;
@@ -3787,13 +3855,12 @@ async function runProviderBridge(): Promise<void> {
       }
       const selected = selectedModel(params, route);
       const native = nativeRuntimeForRoute(route);
-      const nextParams = {
-        ...stripRequestProvider(params),
+      const nextParams = applyRequestProvider({
         ...(route.settings || {}),
+        ...params,
         threadId: route.nativeId,
         model: nativeModel(params, route),
-        modelProvider: NATIVE_EGRESS_PROVIDER,
-      };
+      }, NATIVE_EGRESS_PROVIDER);
       sendParent(native, message, "thread/fork", nextParams, {
         displayModel: selected,
         displayProvider: providerForModel(selected),
@@ -4020,13 +4087,12 @@ async function runProviderBridge(): Promise<void> {
       // Never forward the Desktop picker's provider-owned model or provider
       // name into this native read; model selection must not change the local
       // thread identity or make native thread/read reject the request.
-      const nextParams = {
-        ...stripRequestProvider(params),
+      const nextParams = applyRequestProvider({
+        ...params,
         threadId: route.nativeId,
         model: nativeModel({}, route),
-        modelProvider: NATIVE_PROVIDER,
         ...(params.includeTurns === undefined ? { includeTurns: true } : {}),
-      };
+      }, NATIVE_PROVIDER);
       const childDisplay = nativeDisplaySettingsForRoute(route);
       let archiveRepairAttempted = false;
       const decoratedReadResponse = (response: JsonRecord): JsonRecord => {
@@ -4134,12 +4200,11 @@ async function runProviderBridge(): Promise<void> {
         }
       } catch {}
       const native = nativeRuntimeForRoute(route);
-      const nextParams = {
-        ...stripRequestProvider(params),
+      const nextParams = applyRequestProvider({
+        ...params,
         threadId: route.nativeId,
         model: selected,
-        modelProvider: NATIVE_PROVIDER,
-      };
+      }, NATIVE_PROVIDER);
       sendParent(native, message, "thread/settings/update", nextParams, {
         externalThreadId: route.externalId,
         physicalThreadId: route.nativeId,

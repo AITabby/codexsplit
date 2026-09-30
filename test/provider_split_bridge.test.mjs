@@ -25,6 +25,7 @@ import {
   nativeRuntimeArgs,
   normalizeThreadListParams,
   resolveClientCreatedThreadId,
+  applyRequestProvider,
 } from "../dist/codex-provider-bridge.js";
 import {
   buildDesktopLaunchEnvironment,
@@ -294,15 +295,16 @@ test("native child routing is request-scoped and leaves the native provider unto
   assert.equal(shouldResolveSubagentRoute(true, false), true);
 
   const args = nativeRuntimeArgs(["--profile", "default", "app-server", "--listen", "stdio"], 43127);
-  assert.deepEqual(args.slice(0, 12), [
+  assert.deepEqual(args.slice(0, 14), [
     "--profile", "default",
     "-c", "model_provider=opencodex",
     "-c", "model_providers.opencodex.base_url=http://127.0.0.1:43127/v1",
     "-c", "model_providers.opencodex.wire_api=responses",
     "-c", "model_providers.opencodex.requires_openai_auth=false",
     "-c", "openai_base_url=http://127.0.0.1:43127/v1",
+    "-c", "chatgpt_base_url=http://127.0.0.1:43127/v1/backend-api/",
   ]);
-  assert.deepEqual(args.slice(12, 20), [
+  assert.deepEqual(args.slice(14, 22), [
     "-c", "experimental_realtime_webrtc_call_base_url=http://127.0.0.1:43127/v1",
     "-c", "experimental_realtime_ws_base_url=ws://127.0.0.1:43127/v1/realtime",
     "-c", "features.responses_websockets=false",
@@ -310,7 +312,7 @@ test("native child routing is request-scoped and leaves the native provider unto
   ]);
   assert.equal(args.filter((value) => value.startsWith("experimental_realtime_")).length, 2);
   assert.equal(args.includes("model_provider=opencodex"), true);
-  assert.equal(args[20], "app-server");
+  assert.equal(args[22], "app-server");
 });
 
 test("native Live response ids can bind the following sideband to the same account", () => {
@@ -1404,3 +1406,28 @@ test("1.1.5 keeps one local native conversation and routes provider turns at Egr
   assert.doesNotMatch(launcher.slice(stopStart), /stopDesktopClients\(\)/);
   assert.doesNotMatch(launcher.slice(stopStart), /clearOwnedProviderBridgeLaunchEnvironment\(\)/);
 });
+
+test("applyRequestProvider sanitizes mobile remote requests with OpenAI provider fields", () => {
+  const remotePayload = {
+    threadId: "01a0f1a3-27b5-7cd0-9cc1-13bec5718d54",
+    model: "antigravity/gemini-3.8-flash-high",
+    model_provider: "openai",
+    model_provider_id: "openai",
+    modelProvider: "openai",
+    threadSettings: {
+      model: "antigravity/gemini-3.8-flash-high",
+      model_provider: "openai",
+      model_provider_id: "openai",
+      modelProvider: "openai",
+    },
+  };
+  const sanitized = applyRequestProvider(remotePayload, "opencodex");
+  assert.equal(sanitized.model_provider, "opencodex");
+  assert.equal(sanitized.modelProvider, "opencodex");
+  assert.equal(sanitized.model_provider_id, "opencodex");
+  assert.equal(sanitized.threadSettings.model_provider, "opencodex");
+  assert.equal(sanitized.threadSettings.modelProvider, "opencodex");
+  assert.equal(sanitized.threadSettings.model_provider_id, "opencodex");
+  assert.equal(sanitized.model, "antigravity/gemini-3.8-flash-high");
+});
+
