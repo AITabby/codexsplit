@@ -1859,10 +1859,18 @@ export class GatewayRouter {
           || ""
         ).trim().toLowerCase();
 
-        // gemini-3.8-flash-high is Codex's virtual model name.
-        // On daily-cloudcode-pa, gemini-3-flash is the primary model that supports function declarations and thought signatures.
-        if (antigravityModel === "gemini-3.8-flash-high") {
-          antigravityModel = "gemini-3-flash";
+        // Map reasoning effort to the appropriate Google Antigravity flash tier.
+        // Google daily-cloudcode-pa natively supports gemini-3.8-flash-low (TTFB ~2s),
+        // gemini-3.8-flash-medium (TTFB ~2.6s), and gemini-3.8-flash-high (TTFB ~2.6-8s).
+        // Never downgrade to legacy unoptimized gemini-3-flash which takes 15-18s upstream.
+        if (antigravityModel === "gemini-3.8-flash-high" || antigravityModel === "gemini-3-flash") {
+          if (requestedEffort === "low") {
+            antigravityModel = "gemini-3.8-flash-low";
+          } else if (requestedEffort === "medium") {
+            antigravityModel = "gemini-3.8-flash-medium";
+          } else {
+            antigravityModel = "gemini-3.8-flash-high";
+          }
         }
 
         finalPayloadBody = {
