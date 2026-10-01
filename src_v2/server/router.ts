@@ -2104,6 +2104,11 @@ export class GatewayRouter {
       },
     );
     let engineStarted = false;
+    if (!res.headersSent) {
+      res.writeHead(200, {});
+    }
+    await engine.start(writeSse);
+    engineStarted = true;
     const emitFailedResponse = async (message: string, code = "provider_request_failed"): Promise<void> => {
       if (!engineStarted) {
         await engine.start(writeSse);
@@ -2444,9 +2449,11 @@ export class GatewayRouter {
         return { completed: false, output: "" };
       }
 
-      res.flushHeaders();
-      await engine.start(writeSse);
-      engineStarted = true;
+      if (!engineStarted) {
+        res.flushHeaders();
+        await engine.start(writeSse);
+        engineStarted = true;
+      }
 
       const reader = acquireCursorStreamReader(response, matchedPendingCursorTool?.providerReader);
       const decoder = new TextDecoder();
