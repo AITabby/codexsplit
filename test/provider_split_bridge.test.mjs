@@ -1297,8 +1297,8 @@ test("managed config keeps opencodex as default for remote mobile and local gate
     "/tmp/custom_model_catalog.json",
   );
 
-  assert.match(config, /model_provider = "opencodex"/);
-  assert.doesNotMatch(config, /model_provider = "openai"/);
+  assert.match(config, /model_provider = "openai"/);
+  assert.doesNotMatch(config, /model_provider = "opencodex"/);
   assert.doesNotMatch(config, /openai_base_url/);
   assert.match(config, /base_url = "http:\/\/127\.0\.0\.1:8765\/v1"/);
 });

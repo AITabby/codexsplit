@@ -375,8 +375,8 @@ test("managed Codex config follows the current gateway port across restarts", ()
   const existing = `model = "gpt-5.5"\n\n# >>> opencodex managed >>>\nmodel_catalog_json = "/Users/test/.opencodex/custom_model_catalog.json"\nopenai_base_url = "http://127.0.0.1:18421/v1"\n# <<< opencodex managed >>>\n\n# >>> opencodex managed >>>\n[model_providers.opencodex]\nbase_url = "http://127.0.0.1:18421/v1"\n# <<< opencodex managed <<<\n`;
   const next = buildManagedCodexConfig(existing, 19753, "test-admin-token", "/Users/test/.opencodex/custom_model_catalog.json");
 
-  assert.match(next, /model_provider = "opencodex"/);
-  assert.doesNotMatch(next, /model_provider = "openai"/);
+  assert.match(next, /model_provider = "openai"/);
+  assert.doesNotMatch(next, /model_provider = "opencodex"/);
   assert.doesNotMatch(next, /openai_base_url/);
   assert.match(next, /base_url = "http:\/\/127\.0\.0\.1:19753\/v1"/);
   assert.match(next, /experimental_bearer_token = "test-admin-token"/);
