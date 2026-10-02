@@ -342,8 +342,14 @@ export class GoogleGeminiAdapter implements ProtocolAdapter {
   public processStreamChunk(eventData: any): any[] {
     if (!eventData || typeof eventData !== "object") return [];
     const chunks: any[] = [];
+    const usageMetadata = eventData.response?.usageMetadata || eventData.usageMetadata;
     const candidate = (eventData.response?.candidates || eventData.candidates || [])[0];
-    if (!candidate) return chunks;
+    if (!candidate) {
+      if (usageMetadata) {
+        chunks.push({ usage: usageMetadata });
+      }
+      return chunks;
+    }
 
     const candidateSig = candidate.content?.thoughtSignature
       || candidate.content?.thought_signature
@@ -419,6 +425,13 @@ export class GoogleGeminiAdapter implements ProtocolAdapter {
     }
     if (candidate.finishReason) {
       this.pendingThoughtSignature = null;
+    }
+    if (usageMetadata) {
+      if (chunks.length > 0) {
+        chunks[chunks.length - 1].usage = usageMetadata;
+      } else {
+        chunks.push({ usage: usageMetadata });
+      }
     }
     return chunks;
   }

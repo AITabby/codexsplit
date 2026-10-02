@@ -255,11 +255,22 @@ interface ImageGenerationState {
 
 function normalizeResponseUsage(raw: any): Record<string, any> | undefined {
   if (!raw || typeof raw !== "object") return undefined;
-  const rawInput = Number(raw.input_tokens ?? raw.prompt_tokens);
-  const rawOutput = Number(raw.output_tokens ?? raw.completion_tokens);
+  // Standard OpenAI / Responses shape, or Google Gemini usageMetadata, or Anthropic usage
+  const rawInput = Number(
+    raw.input_tokens ??
+    raw.prompt_tokens ??
+    raw.promptTokenCount ??
+    raw.input_token_count,
+  );
+  const rawOutput = Number(
+    raw.output_tokens ??
+    raw.completion_tokens ??
+    raw.candidatesTokenCount ??
+    raw.output_token_count,
+  );
   const input = Number.isFinite(rawInput) ? rawInput : 0;
   const output = Number.isFinite(rawOutput) ? rawOutput : 0;
-  const rawTotal = Number(raw.total_tokens);
+  const rawTotal = Number(raw.total_tokens ?? raw.totalTokenCount);
   const total = Number.isFinite(rawTotal) ? rawTotal : input + output;
   if (![rawInput, rawOutput, rawTotal].some((value) => Number.isFinite(value))) return undefined;
 
@@ -272,7 +283,12 @@ function normalizeResponseUsage(raw: any): Record<string, any> | undefined {
     : raw.prompt_tokens_details && typeof raw.prompt_tokens_details === "object"
       ? raw.prompt_tokens_details
       : {};
-  const rawCached = Number(raw.cached_tokens ?? raw.cached_input_tokens ?? rawDetails.cached_tokens);
+  const rawCached = Number(
+    raw.cached_tokens ??
+    raw.cached_input_tokens ??
+    raw.cachedContentTokenCount ??
+    rawDetails.cached_tokens,
+  );
   // Codex Desktop parses the Responses usage shape strictly. Several
   // OpenAI-compatible providers emit input_tokens_details without the
   // required cached_tokens member; default that optional metric to zero at
@@ -364,8 +380,32 @@ export class ResponsesStreamEngine {
 
   /** Preserve provider usage for the Responses response consumed by Codex. */
   public observeProviderChunk(chunk: any): void {
-    const usage = normalizeResponseUsage(chunk?.usage || chunk?.response?.usage);
-    if (usage) this.usage = usage;
+    const rawUsage = chunk?.usage
+      || chunk?.response?.usage
+      || chunk?.usageMetadata
+      || chunk?.response?.usageMetadata
+      || chunk?.delta?.usage;
+    const usage = normalizeResponseUsage(rawUsage);
+    if (usage) {
+      if (!this.usage) {
+        this.usage = usage;
+      } else {
+        // Merge incremental metrics (e.g. Anthropic message_delta gives output_tokens, while message_start gave input_tokens)
+        const mergedInput = usage.input_tokens || this.usage.input_tokens || 0;
+        const mergedOutput = usage.output_tokens || this.usage.output_tokens || 0;
+        this.usage = {
+          ...this.usage,
+          ...usage,
+          input_tokens: mergedInput,
+          output_tokens: mergedOutput,
+          total_tokens: usage.total_tokens || (mergedInput + mergedOutput),
+          input_tokens_details: {
+            ...(this.usage.input_tokens_details || {}),
+            ...(usage.input_tokens_details || {}),
+          },
+        };
+      }
+    }
   }
 
   /** Internal gateway tool calls are deliberately never emitted as client tools. */

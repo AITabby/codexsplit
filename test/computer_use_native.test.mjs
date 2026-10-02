@@ -626,10 +626,9 @@ test("capThirdPartyChatHistory never starts with an orphaned tool message and al
   // Window size of 4 would land on index 5 (messages.length 9 - 4 = 5), which is a `tool` message!
   const result = capThirdPartyChatHistory(messages, "google", 4);
   assert.ok(result.dropped > 0, "Should have dropped messages");
-  // The first kept message (after the system note at index 0) must NOT be a tool message
-  const keptMessages = result.messages.slice(1);
-  assert.notEqual(keptMessages[0].role, "tool", "First kept message must NEVER be a tool message");
-  assert.equal(keptMessages[0].role, "user", "Should align cleanly to a user turn");
+  // The first kept message (pure transcript, no synthetic note) must NOT be a tool message
+  assert.notEqual(result.messages[0].role, "tool", "First kept message must NEVER be a tool message");
+  assert.equal(result.messages[0].role, "user", "Should align cleanly to a user turn");
 });
 
 test("GoogleGeminiAdapter strictly guarantees functionResponse turn comes immediately after functionCall turn", () => {

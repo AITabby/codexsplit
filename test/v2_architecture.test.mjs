@@ -1202,27 +1202,26 @@ test("v2 executes internal image calls without leaking them as client function c
   assert.equal(events.some((event) => event.item?.type === "message"), false);
 });
 
-test("third-party chat history is capped to bound input-token usage on long sessions", () => {
+test("third-party chat history inherits full context faithfully matching native GPT", () => {
   const longInput = [];
   for (let i = 0; i < 743; i += 1) {
     longInput.push({ role: "user", content: `message-${i}` });
     longInput.push({ role: "assistant", content: `reply-${i}` });
   }
-  const capped = transformResponsesToChat({
+  const transformed = transformResponsesToChat({
     model: "minimax-m3",
     input: longInput,
   }, "MiniMax-M3", undefined, true, "minimax");
-  const systemMessages = capped.messages.filter((message) => message.role === "system");
-  // The bridge note is the only system message when the dev environment
-  // doesn't ship an instructions string. It must always name the adapter.
-  assert.equal(systemMessages.length, 1);
-  assert.match(systemMessages[0].content, /CodexSplit Bridge/);
-  assert.match(systemMessages[0].content, /minimax/);
-  // The total transcript must not exceed the cap plus the synthetic note.
-  assert.ok(capped.messages.length <= THIRD_PARTY_HISTORY_WINDOW + 1);
-  // The last user turn is the freshest message in the thread, so it survives.
-  assert.equal(capped.messages.at(-1).role, "assistant");
-  assert.equal(capped.messages.at(-1).content, `reply-${742}`);
+  // No synthetic bridge notes injected; pure history is preserved
+  assert.equal(
+    transformed.messages.some((message) => /CodexSplit Bridge/.test(String(message.content))),
+    false,
+  );
+  // Full context is preserved
+  assert.equal(transformed.messages.length, longInput.length);
+  // The first user turn and last assistant turn survive intact
+  assert.equal(transformed.messages[0].content, "message-0");
+  assert.equal(transformed.messages.at(-1).content, `reply-${742}`);
 });
 
 test("third-party history cap leaves short sessions untouched", () => {

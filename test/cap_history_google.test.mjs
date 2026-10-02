@@ -8,16 +8,16 @@ import {
 } from "../dist/core/transformer.js";
 import { GoogleGeminiAdapter } from "../dist/adapters/google.js";
 
-test("getThirdPartyHistoryWindow returns 256 for google/gemini and 32 for others", () => {
-  assert.equal(getThirdPartyHistoryWindow("google"), GOOGLE_THIRD_PARTY_HISTORY_WINDOW);
-  assert.equal(getThirdPartyHistoryWindow("gemini"), GOOGLE_THIRD_PARTY_HISTORY_WINDOW);
-  assert.equal(getThirdPartyHistoryWindow("Google"), GOOGLE_THIRD_PARTY_HISTORY_WINDOW);
-  assert.equal(getThirdPartyHistoryWindow("minimax"), DEFAULT_THIRD_PARTY_HISTORY_WINDOW);
-  assert.equal(getThirdPartyHistoryWindow("deepseek"), DEFAULT_THIRD_PARTY_HISTORY_WINDOW);
-  assert.equal(getThirdPartyHistoryWindow(), DEFAULT_THIRD_PARTY_HISTORY_WINDOW);
+test("getThirdPartyHistoryWindow returns 0 by default so all models inherit full context", () => {
+  assert.equal(getThirdPartyHistoryWindow("google"), 0);
+  assert.equal(getThirdPartyHistoryWindow("gemini"), 0);
+  assert.equal(getThirdPartyHistoryWindow("antigravity"), 0);
+  assert.equal(getThirdPartyHistoryWindow("minimax"), 0);
+  assert.equal(getThirdPartyHistoryWindow("deepseek"), 0);
+  assert.equal(getThirdPartyHistoryWindow(), 0);
 });
 
-test("capThirdPartyChatHistory preserves initiating user instruction during long tool sequences", () => {
+test("capThirdPartyChatHistory preserves initiating user instruction without synthetic notes when explicit window is set", () => {
   // Simulate a user request followed by 25 tool turns (50 messages)
   const messages = [
     { role: "user", content: "更新吧，对比官方最新版本升级并测试" },
@@ -44,16 +44,12 @@ test("capThirdPartyChatHistory preserves initiating user instruction during long
   const result = capThirdPartyChatHistory(messages, "google", 10);
   assert.ok(result.dropped > 0, "Should report dropped messages");
 
-  // The first message is the system bridge note
-  assert.equal(result.messages[0].role, "system");
-  assert.match(result.messages[0].content, /CodexSplit Bridge/);
-
-  // The second message MUST be the preserved initiating user prompt!
-  assert.equal(result.messages[1].role, "user");
-  assert.equal(result.messages[1].content, "更新吧，对比官方最新版本升级并测试");
+  // No synthetic system bridge note injected! The first message MUST be the preserved user prompt!
+  assert.equal(result.messages[0].role, "user");
+  assert.equal(result.messages[0].content, "更新吧，对比官方最新版本升级并测试");
 
   // The rest are the most recent tool executions
-  const rest = result.messages.slice(2);
+  const rest = result.messages.slice(1);
   assert.ok(rest.length > 0);
   assert.equal(rest.at(-1).role, "tool");
   assert.equal(rest.at(-1).tool_call_id, "call_25");

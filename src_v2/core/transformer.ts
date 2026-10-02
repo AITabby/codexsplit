@@ -617,14 +617,14 @@ import { SessionHistoryService } from "../services/session_history.js";
  * The cap only trims the *reconstructed history*; the current user/assistant
  * turn, tool calls and tool results for that turn are always preserved. A
  * synthetic system note is inserted whenever older turns are dropped so the
- * downstream model still knows that context existed upstream.
- *
- * The window can be overridden per-process through `OPENCODEX_THIRD_PARTY_HISTORY_WINDOW`
- * (positive integer; `0` disables the cap). Native Codex GPT responses never
- * flow through this function, so the cap cannot affect that path.
+/**
+ * By default, third-party models inherit the full reconstructed session
+ * history faithfully without synthetic truncation, matching official GPT.
+ * Truncation is only enabled if explicitly configured via
+ * `OPENCODEX_THIRD_PARTY_HISTORY_WINDOW` > 0.
  */
-export const DEFAULT_THIRD_PARTY_HISTORY_WINDOW = 32;
-export const GOOGLE_THIRD_PARTY_HISTORY_WINDOW = 256;
+export const DEFAULT_THIRD_PARTY_HISTORY_WINDOW = 0;
+export const GOOGLE_THIRD_PARTY_HISTORY_WINDOW = 0;
 
 export function getThirdPartyHistoryWindow(adapterName?: string): number {
   const raw = process.env.OPENCODEX_THIRD_PARTY_HISTORY_WINDOW;
@@ -632,10 +632,6 @@ export function getThirdPartyHistoryWindow(adapterName?: string): number {
     const parsed = Number(raw);
     if (!Number.isFinite(parsed) || parsed < 0) return DEFAULT_THIRD_PARTY_HISTORY_WINDOW;
     return Math.floor(parsed);
-  }
-  const norm = String(adapterName || "").toLowerCase().trim();
-  if (norm === "google" || norm === "gemini") {
-    return GOOGLE_THIRD_PARTY_HISTORY_WINDOW;
   }
   return DEFAULT_THIRD_PARTY_HISTORY_WINDOW;
 }
@@ -720,17 +716,9 @@ export function capThirdPartyChatHistory(
     return { messages, dropped: 0 };
   }
 
-  const providerLabel = String(adapterName || "third-party").trim() || "third-party";
-  const note: ChatMessage = {
-    role: "system",
-    content:
-      `[CodexSplit Bridge] Dropped the oldest ${dropped} message(s) of this Codex session `
-      + `before forwarding the request to the third-party provider "${providerLabel}". `
-      + `Native GPT keeps prompt-cache discounts on long transcripts; third-party APIs do not, `
-      + `so trimming here keeps input-token usage bounded for providers that bill every token. `
-      + `The initiating user instruction and the remaining ${kept.length} messages below are preserved from the local Codex session.`,
-  };
-  return { messages: [note, ...kept], dropped };
+  // Never inject synthetic system notes or prompt notices into the conversation;
+  // keep the preserved history pure and transparent to the model.
+  return { messages: kept, dropped };
 }
 
 export function transformResponsesToChat(

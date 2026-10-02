@@ -177,6 +177,10 @@ export class AnthropicAdapter implements ProtocolAdapter {
           }]
         });
       }
+    } else if (type === "message_start" && eventData.message?.usage) {
+      chunks.push({ usage: eventData.message.usage });
+    } else if (type === "message_delta" && eventData.usage) {
+      chunks.push({ usage: eventData.usage });
     }
     return chunks;
   }
