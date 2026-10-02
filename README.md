@@ -66,27 +66,23 @@ CodexSplit 是运行在本机的 Codex Desktop 控制中心：管理第三方模
 
 ## 简体中文
 
-### 先理解四条链路
+### 先理解当前架构与四条链路
 
-这四条链路互相独立，排查问题时不要把“网关”“Desktop Bridge”“官方账号池”当成同一个东西。
+CodexSplit 现已全面演进为 **原生 Gateway + SQLite 触发器双路由架构**：第三方模型直接通过原生 HTTP 请求直连网关，与原生官方 GPT 完全物理解耦。
 
-| 场景 | 实际路径 | 说明 |
-| --- | --- | --- |
-| 官方 GPT 普通主会话 | Codex 原生 OpenAI provider / Native Egress | 不经过第三方 Provider 适配器；主会话、线程、工具和历史仍由 Codex 原生 app-server 管理 |
-| GPT-Live 对话本身 | Codex 原生 Live / Realtime | Live 交流始终是 Live；账号跟随已配置的官方 GPT 账号池 |
-| 第三方模型主会话 | CodexSplit 本地网关，默认 <code>127.0.0.1:8765</code> | 只有用户添加、导入并应用的第三方模型走这里 |
-| <code>spawn_agent</code> / 派任务 | 按 Agent 路由选择模型 | 主会话仍保持原路径；明确产生的子任务才按 Profile 进入第三方网关或其他已配置模型 |
+| 场景 | 实际路径 | 桥（Bridge）是否参与 | 说明 |
+| --- | --- | --- | --- |
+| **官方 GPT 普通主会话（单账号）** | Codex 原生 OpenAI 直连 | ❌ 不参与 | 原生直连 OpenAI 官方接口，完全绕过本地网关，网关离线也不受任何影响 |
+| **官方 GPT 多账号池轮询** | Codex 原生 app-server + Desktop Bridge (Native Egress) | ✅ **仅在此场景生效** | 官方客户端原生仅支持单账号，**这是目前保留 Desktop Bridge 进程拦截的核心作用**：在官方额度用尽时动态注入下一个官方账号凭证进行故障转移与轮询 |
+| **第三方模型主会话** | 原生 Direct HTTP → CodexSplit 本地网关（默认 `127.0.0.1:8765`） | ❌ 不参与 | 通过 SQLite 触发器自动将第三方会话路由至 `opencodex` provider，原生发 HTTP 请求给网关，无 stdio 拦截损耗，全量保留上下文历史与实时 Token 统计 |
+| **`spawn_agent` / 派任务** | 按 Agent 路由选择目标模型 | ❌ 不参与 | 主会话保持原路径；明确派发的子任务按配置直接进入网关或对应模型 |
 
-官方路径经过本机 Native Egress 时仍可能经过本地进程，但它不是第三方 <code>8765</code> Provider 路由。GPT-Live 的父对话也不会因为网关开启就变成第三方模型；只有 Live 明确把工作交给子智能体时，子任务才使用 Agent 路由。
+### 网关与 Desktop Bridge 的职责分工
 
-### 网关、Desktop Bridge 和 CodexSplit App 的区别
-
-- **网关**：负责 Provider、API Key、模型目录、协议适配和第三方请求，独立启动时默认监听 <code>127.0.0.1:8765</code>。
-- **Desktop Bridge**：Codex Desktop 的进程级运行模式开关。开启后，Desktop 才能看到并使用待应用的第三方模型；切换开关会重启 Desktop。
-- **CodexSplit App**：控制中心和网关管理界面。打开 App 不等于重启 Codex；首次启动或普通打开 App 不应偷偷接管 Desktop。
-- **GPT 账号池**：只管理官方 ChatGPT/Codex 登录账号，不是第三方 API Key 池。
-
-DMG 会管理自己的本地控制服务；从源码启动时，<code>npm start</code> 默认使用 <code>8765</code>。如果只想测试原生 GPT，可以关闭独立的 <code>8765</code> 网关；第三方模型会不可用，但官方原生路径不应因此改走第三方网关。
+- **CodexSplit 网关（核心）**：独立运行在 `127.0.0.1:8765`。负责管理第三方模型（Claude、Gemini、DeepSeek、Qwen、MiniMax 等）、API Key 轮询池、本地 OAuth 订阅（Antigravity / Grok / Cursor 等）、协议转换（Responses ↔ Chat）以及上下文与 Token 统计规范化。**只要不使用官方多账号轮询，日常使用各种第三方模型只需运行网关即可。**
+- **Desktop Bridge（仅多账号池需要）**：通过 stdio 进程管道为原生 Codex 提供侧路拦截。**它的现存价值仅在于：在原生官方 GPT 上实现多账号轮流使用（Account Pool 额度轮询与 429 故障转移）**，以及少数多智能体派发的桌面端 UI 强制刷新。
+- **CodexSplit App**：控制中心和配置面板。管理网关、账号池、路由规则与本地会话。
+- **上下文继承原则**：不管是第三方模型还是官方 GPT，CodexSplit 默认 100% 忠实传递全量原始对话与工具调用历史，绝不进行暴力消息截断，绝不注入任何人工伪提示词（System Note）。会话上限完全交给 Codex 原生 Auto-Compaction 流程。
 
 ## 安装和第一次使用
 
@@ -151,17 +147,18 @@ Key 只属于这个 Provider，密钥保存在 macOS Keychain；前端只显示�
 
 订阅导入按实时返回的模型目录工作，不会只凭硬编码列表声称模型可用。
 
-### 4. Desktop Bridge 开关
+### 4. Desktop Bridge 开关（何时需要开启？）
 
 在网关页的 Desktop Bridge 卡片中：
 
-- **开启**：保存的第三方模型对 Desktop 暴露，并重启 Desktop 进入 Bridge 模式。
-- **关闭**：重启 Desktop，恢复官方原生模型菜单；Provider、API Key、订阅和模型配置保留。
-- **普通打开 CodexSplit**：不应因为 App 启动就重启 Codex。
-- **普通重启网关**：不等于切换 Bridge，也不应删除已保存配置。
-- **“重启 Codex（应用模型菜单）”**：是应用待应用模型和重新加载 Desktop 模型菜单的显式动作。
-
-网关停止后，第三方请求没有 <code>8765</code> 可达；官方 GPT 和官方 GPT-Live 仍由原生路径负责。若 Bridge 已经开启，停止网关不会把已保存的 Bridge 状态改成关闭；要恢复原生模式，使用 Desktop Bridge 开关关闭或使用“恢复原生 Codex”。
+- **普通用户（使用第三方模型 + 单官方账号）**：
+  在最新的双路由架构下，第三方模型已通过 `~/.codex/config.toml` 原生配置与数据库触发器直连网关，**日常无需开启 Desktop Bridge 即可直接使用所有第三方模型**。
+- **需要官方账号池轮换的用户**：
+  开启 Desktop Bridge。此时 Bridge 会在后台启动并挂载原生 stdio 代理通道，当你在主会话中使用官方 GPT 时，Bridge 会为你实时监测 5 小时限额并在用尽时自动切换下一个官方账号。
+- **开关行为说明**：
+  - **开启**：挂载原生进程级 Egress 代理，并按需刷新 Desktop。
+  - **关闭**：恢复纯净的官方原生启动方式，完全不经过任何中间进程拦截。已保存的第三方模型配置仍然保留并在网关下正常可用。
+  - **“重启 Codex（应用模型菜单）”**：无论是否使用 Bridge，在更新了模型目录后点击此按钮，都可以重新生成并写入 Codex 的模型列表。
 
 ### 5. 独立启动、停止和检查 <code>8765</code>
 
@@ -436,25 +433,23 @@ CodexSplit
 
 CodexSplit is a local control center for Codex Desktop. It manages third-party providers, model metadata, the official GPT account pool, GPT-Live handoffs, voice settings, Agent routing, and local session import while keeping native Codex behavior available.
 
-### Four routing boundaries
+### Modern Dual-Routing Architecture
 
-| Scenario | Path | Meaning |
-| --- | --- | --- |
-| Official GPT main conversation | Native OpenAI provider / Native Egress | Native Codex app-server owns the thread, history, tools, and lifecycle; it does not use a third-party Provider adapter |
-| GPT-Live conversation | Native Live / Realtime | The Live conversation remains Live and follows the selected official GPT account-pool policy |
-| Third-party main model | CodexSplit local gateway, normally <code>127.0.0.1:8765</code> | Only models explicitly added, imported, tested, and applied by the user use this route |
-| <code>spawn_agent</code> / task handoff | Agent Routing and the selected Profile | The parent keeps its own path; only the explicit child task is routed to the selected model |
+CodexSplit utilizes a **Native Gateway + SQLite Trigger Dual-Routing Architecture**: third-party models communicate directly with the local gateway via native HTTP, cleanly separated from native official GPT.
 
-Official traffic may still cross a local Native Egress process, but that is not the third-party Provider route on <code>8765</code>. Opening the gateway does not turn the GPT-Live parent conversation into a third-party model; only an explicit Live task handoff crosses the child-task boundary.
+| Scenario | Actual Path | Bridge Involved? | Explanation |
+| --- | --- | --- | --- |
+| **Official GPT (Single Account)** | Codex Native OpenAI Direct | ❌ No | Bypasses local gateway completely; connects directly to OpenAI with zero overhead even if the gateway is offline |
+| **Official GPT Account Pool** | Codex Native app-server + Desktop Bridge (Native Egress) | ✅ **Only here** | Codex natively only supports a single account. **This is the primary remaining purpose of Desktop Bridge**: dynamic credential injection during 5-hour rate limits and quota failover |
+| **Third-Party Model Main Session** | Native Direct HTTP → CodexSplit Gateway (`127.0.0.1:8765`) | ❌ No | Routed to `opencodex` provider automatically via SQLite triggers. Full conversation context and live Token usage are 100% faithfully preserved |
+| **`spawn_agent` / Task Delegation** | Routed by Agent Capability Profile | ❌ No | Main conversation keeps its path; delegated child tasks route directly to configured targets |
 
-### Gateway, Desktop Bridge, and the CodexSplit app
+### Gateway vs Desktop Bridge Roles
 
-- **Gateway**: manages Providers, API Keys, model discovery, protocol adapters, and third-party requests. A source checkout listens on <code>127.0.0.1:8765</code> by default.
-- **Desktop Bridge**: a process-level Codex Desktop mode switch. Enabling or disabling it restarts Desktop so the model menu is rebuilt safely.
-- **CodexSplit app**: the local control center and gateway UI. Opening the app does not mean restarting Codex Desktop.
-- **GPT Account Pool**: manages official ChatGPT/Codex login accounts, not third-party API Keys.
-
-The DMG manages its own local control service. A source checkout uses <code>npm start</code> and the default port <code>8765</code>. If you stop the standalone <code>8765</code> gateway for isolation testing, third-party models should stop working while native official GPT remains on its native path.
+- **CodexSplit Gateway (Core)**: Listens on `127.0.0.1:8765`. Manages third-party models (Claude, Gemini, DeepSeek, Qwen, MiniMax, etc.), API Key credential pools, local OAuth subscriptions (Antigravity, Grok, Cursor, etc.), protocol transformations (Responses ↔ Chat), and token usage normalization. **If you do not use official multi-account rotation, daily third-party model usage requires only the gateway running.**
+- **Desktop Bridge (Only for Account Pool)**: An optional stdio interceptor. **Its sole purpose is rotating multiple official ChatGPT accounts on native GPT** (quota-weighted round-robin and 429 failover), plus occasional desktop UI refresh triggers.
+- **CodexSplit App**: Local control dashboard for managing models, credentials, routing policies, and sessions.
+- **Context Preservation Guarantee**: Both official and third-party models inherit 100% complete session history without synthetic truncation or fake system notices. Upper limits are natively managed by Codex's auto-compaction.
 
 ## Installation and first use
 
@@ -521,17 +516,18 @@ Under **Gateway → Local Subscription Import**:
 
 Subscription imports use live model discovery instead of claiming that a hardcoded model list is available.
 
-### 4. Use the Desktop Bridge switch
+### 4. Desktop Bridge Switch (When is it needed?)
 
 On the Desktop Bridge card:
 
-- **Enable**: expose saved third-party models to Desktop and restart Desktop into Bridge mode.
-- **Disable**: restart Desktop and restore the official native model menu. Provider, API Key, subscription, and model configuration remain saved.
-- **Open CodexSplit normally**: must not restart Codex just because the app opened.
-- **Restart the gateway normally**: is not the same as switching Bridge and must not delete saved configuration.
-- **Restart Codex (apply model menu)**: explicitly applies pending models and reloads the Desktop model menu.
-
-When the gateway is stopped, third-party requests have no reachable <code>8765</code> route. Official GPT and official GPT-Live remain owned by their native paths. Stopping the gateway does not itself erase the saved Bridge preference; use the Bridge switch or **Restore Native Codex** when you want native Desktop mode.
+- **Regular Users (Third-Party Models + Single Official Account)**:
+  Under the dual-routing architecture, third-party models directly connect to the gateway via native configuration and database triggers. **You do NOT need Desktop Bridge enabled to use third-party models.**
+- **Users requiring Official GPT Account Pool Rotation**:
+  Enable Desktop Bridge. It runs in the background and attaches to the native stdio pipeline, monitoring official rate limits and seamlessly rotating accounts when 5-hour quotas are exhausted.
+- **Switch Behaviors**:
+  - **Enable**: Mounts the native process-level Egress proxy and refreshes Desktop as needed.
+  - **Disable**: Restores a completely clean native launch without intercepting processes. All configured third-party models remain intact and functional via the gateway.
+  - **Restart Codex (apply model menu)**: Regenerates and registers the model catalog in Codex Desktop, regardless of Bridge status.
 
 ### 5. Start, stop, and inspect <code>8765</code>
 
