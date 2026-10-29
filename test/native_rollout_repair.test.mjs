@@ -204,3 +204,78 @@ test("native rollout repair and database repair heal third-party models to openc
     await fs.rm(codexHome, { recursive: true, force: true });
   }
 });
+
+test("sanitizeNativeResponsesBody normalizes message IDs without msg_ prefix for OpenAI compatibility", async () => {
+  const { sanitizeNativeResponsesBody } = await import("../dist/core/responses_safety.js");
+  const rawBody = {
+    model: "gpt-5.6-luna",
+    input: [
+      { id: "msg_clean_123", type: "message", role: "user", content: "hello" },
+      { id: "0731320fbd1f8bc10c14f5be8f25eef5_msg", type: "message", role: "assistant", content: "hi" },
+      { id: "07316456c56af4a43539b69354a7bdb5_msg_1", type: "message", role: "assistant", content: "how are you" },
+      { id: "call_legacy_1", type: "function_call", name: "test" },
+      { id: "legacy_raw_call", type: "function_call", name: "test2" },
+      { type: "function_call_output", call_id: "legacy_raw_call", output: "ok" },
+    ],
+  };
+
+  const result = sanitizeNativeResponsesBody(rawBody);
+  assert.equal(result.body.input[0].id, "msg_clean_123");
+  assert.equal(result.body.input[1].id, "msg_0731320fbd1f8bc10c14f5be8f25eef5");
+  assert.equal(result.body.input[2].id, "msg_07316456c56af4a43539b69354a7bdb5");
+  assert.equal(result.body.input[3].id, "call_legacy_1");
+  assert.equal(result.body.input[4].id, "fc_legacy_raw_call");
+  assert.equal(result.body.input[5].call_id, "fc_legacy_raw_call");
+});
+
+test("sanitizeNativeResponsesBody strips unencrypted reasoning items and forces content to empty array", async () => {
+  const { sanitizeNativeResponsesBody } = await import("../dist/core/responses_safety.js");
+  const rawBody = {
+    model: "gpt-5.6-luna",
+    input: [
+      { id: "msg_user_1", type: "message", role: "user", content: "hello" },
+      // Gateway/foreign reasoning item with null encrypted_content
+      { id: "rs_thirdparty_123", type: "reasoning", encrypted_content: null, content: ["third-party reasoning text"], summary: [] },
+      // Native official reasoning item with encrypted_content
+      { id: "rs_native_encrypted", type: "reasoning", encrypted_content: "opaque_ciphertext", content: ["some lingering content"], summary: [] },
+      { id: "0731320fbd1f8bc10c14f5be8f25eef5_msg", type: "message", role: "assistant", content: "response" },
+    ],
+  };
+
+  const result = sanitizeNativeResponsesBody(rawBody);
+  // Unencrypted third-party reasoning should be removed
+  assert.equal(result.removedReasoningItems, 1);
+  assert.equal(result.body.input.length, 3);
+  assert.equal(result.body.input[0].id, "msg_user_1");
+  // Native reasoning item is kept, but its content is enforced to []
+  assert.equal(result.body.input[1].id, "rs_native_encrypted");
+  assert.deepEqual(result.body.input[1].content, []);
+  assert.equal(result.body.input[1].encrypted_content, "opaque_ciphertext");
+  // Message ID normalized
+  assert.equal(result.body.input[2].id, "msg_0731320fbd1f8bc10c14f5be8f25eef5");
+});
+
+test("sanitizeNativeResponsesBody restores additional_tools at_ prefix from corrupted msg_at_", async () => {
+  const { sanitizeNativeResponsesBody } = await import("../dist/core/responses_safety.js");
+  const rawBody = {
+    model: "gpt-5.6-luna",
+    input: [
+      {
+        id: "msg_at_f77e8ba3-a307-57fd-bb05-9ccece5e4544",
+        type: "additional_tools",
+        role: "developer",
+        tools: [],
+      },
+      {
+        id: "at_clean_valid",
+        type: "additional_tools",
+        role: "developer",
+        tools: [],
+      },
+    ],
+  };
+
+  const result = sanitizeNativeResponsesBody(rawBody);
+  assert.equal(result.body.input[0].id, "at_f77e8ba3-a307-57fd-bb05-9ccece5e4544");
+  assert.equal(result.body.input[1].id, "at_clean_valid");
+});

@@ -30,6 +30,7 @@ export const SUBSCRIPTION_LOGIN_CAPABILITIES: Record<SubscriptionProvider, { log
   grok: { login_supported: true, capture_supported: true, login_hint: "将打开 Grok OAuth 登录页，并写入独立账号目录" },
   claude: { login_supported: true, capture_supported: true, login_hint: "将打开 Claude 订阅登录页，并写入独立账号目录" },
   cursor: { login_supported: false, capture_supported: true, login_hint: "请先在 Cursor 客户端切换到目标账号，再捕获当前登录态" },
+  opencode: { login_supported: false, capture_supported: false, login_hint: "自动连接本机 OpenCode Desktop / Free 免费轮换订阅" },
 };
 
 export class SubscriptionAccountLoginService {

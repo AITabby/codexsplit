@@ -1,4 +1,4 @@
-export type SubscriptionTransportId = "antigravity" | "grok" | "claude" | "cursor";
+export type SubscriptionTransportId = "antigravity" | "grok" | "claude" | "cursor" | "opencode";
 
 export interface SubscriptionTransport {
   id: SubscriptionTransportId;
@@ -39,6 +39,12 @@ export const SUBSCRIPTION_TRANSPORTS: Record<SubscriptionTransportId, Subscripti
     endpoint: "https://agent.api5.cursor.sh/agent.v1.AgentService/Run",
     modelsEndpoint: "https://api2.cursor.sh/aiserver.v1.AiService/AvailableModels",
     apiKeySentinel: "cursor-cli-auto",
+  },
+  opencode: {
+    id: "opencode",
+    endpoint: "https://opencode.ai/inference/openai/v1/chat/completions",
+    modelsEndpoint: "https://opencode.ai/zen/v1/models",
+    apiKeySentinel: "opencode-cli-auto",
   },
 };
 

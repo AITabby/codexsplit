@@ -113,6 +113,136 @@ function normalizeReasoningLevels(value: any): Array<{ effort: string; descripti
   return result;
 }
 
+export interface KnownModelSpec {
+  context_window: number;
+  reasoning: boolean;
+  supported_reasoning_levels: Array<{ effort: string; description?: string }>;
+  default_reasoning_level?: string;
+  supports_vision?: boolean;
+}
+
+export function getKnownModelSpec(rawSlug: string): KnownModelSpec | undefined {
+  const slug = String(rawSlug || "").trim().toLowerCase();
+  if (!slug) return undefined;
+  const baseSlug = slug.includes("/") ? slug.split("/").pop()! : slug;
+
+  // MiniMax
+  if (baseSlug.includes("minimax")) {
+    return {
+      context_window: 1_000_000,
+      reasoning: true,
+      supported_reasoning_levels: normalizeReasoningLevels(["low", "medium", "high", "xhigh", "max"]),
+      default_reasoning_level: "medium",
+      supports_vision: true,
+    };
+  }
+
+  // Gemini (Antigravity / Google)
+  if (baseSlug.includes("gemini")) {
+    const isPro = baseSlug.includes("pro");
+    const isThinking = baseSlug.includes("thinking") || baseSlug.includes("high") || baseSlug.includes("low") || baseSlug.includes("2.5") || baseSlug.includes("3.8");
+    const context_window = isPro ? 2_097_152 : 1_048_576;
+    let defaultEffort = "medium";
+    if (baseSlug.includes("-high")) defaultEffort = "high";
+    else if (baseSlug.includes("-low")) defaultEffort = "low";
+    return {
+      context_window,
+      reasoning: isThinking,
+      supported_reasoning_levels: isThinking ? normalizeReasoningLevels(["low", "medium", "high"]) : [],
+      default_reasoning_level: isThinking ? defaultEffort : undefined,
+      supports_vision: true,
+    };
+  }
+
+  // DeepSeek
+  if (baseSlug.includes("deepseek")) {
+    const isFree = baseSlug.includes("free");
+    const isReasoner = baseSlug.includes("reasoner") || baseSlug.includes("r1") || baseSlug.includes("v4.1") || isFree;
+    return {
+      context_window: 131_072,
+      reasoning: true,
+      supported_reasoning_levels: isReasoner ? normalizeReasoningLevels(["low", "medium", "high", "max"]) : normalizeReasoningLevels(["low", "medium", "high"]),
+      default_reasoning_level: isReasoner ? "high" : "medium",
+      supports_vision: false,
+    };
+  }
+
+  // GLM
+  if (baseSlug.includes("glm")) {
+    return {
+      context_window: 204_800,
+      reasoning: true,
+      supported_reasoning_levels: normalizeReasoningLevels(["low", "medium", "high", "max"]),
+      default_reasoning_level: "high",
+      supports_vision: true,
+    };
+  }
+
+  // MiMo
+  if (baseSlug.includes("mimo")) {
+    return {
+      context_window: 262_144,
+      reasoning: true,
+      supported_reasoning_levels: normalizeReasoningLevels(["minimal", "low", "medium", "high"]),
+      default_reasoning_level: "medium",
+      supports_vision: true,
+    };
+  }
+
+  // Grok
+  if (baseSlug.includes("grok")) {
+    const isGrok4 = baseSlug.includes("grok-4") || baseSlug.includes("grok-code");
+    const isGrok3 = baseSlug.includes("grok-3");
+    const isReasoning = isGrok4 || isGrok3;
+    return {
+      context_window: isGrok4 ? 262_144 : 131_072,
+      reasoning: isReasoning,
+      supported_reasoning_levels: isReasoning ? normalizeReasoningLevels(["low", "medium", "high"]) : [],
+      default_reasoning_level: isReasoning ? "medium" : undefined,
+      supports_vision: true,
+    };
+  }
+
+  // Qwen
+  if (baseSlug.includes("qwen") || baseSlug.includes("qwq")) {
+    const isQwQ = baseSlug.includes("qwq");
+    const is36Plus = baseSlug.includes("3.6-plus") || baseSlug.includes("qwen3.6");
+    return {
+      context_window: (is36Plus ? 262_144 : 131_072),
+      reasoning: isQwQ || is36Plus,
+      supported_reasoning_levels: (isQwQ || is36Plus) ? normalizeReasoningLevels(is36Plus ? ["minimal", "low", "medium", "high"] : ["low", "medium", "high"]) : [],
+      default_reasoning_level: (isQwQ || is36Plus) ? "medium" : undefined,
+      supports_vision: true,
+    };
+  }
+
+  // Claude
+  if (baseSlug.includes("claude")) {
+    const is37 = baseSlug.includes("3-7") || baseSlug.includes("3.7");
+    return {
+      context_window: 200_000,
+      reasoning: is37,
+      supported_reasoning_levels: is37 ? normalizeReasoningLevels(["low", "medium", "high", "max"]) : [],
+      default_reasoning_level: is37 ? "medium" : undefined,
+      supports_vision: true,
+    };
+  }
+
+  // GPT Official / Reserve
+  if (baseSlug.startsWith("gpt-5.6") || baseSlug.startsWith("gpt-6") || baseSlug === "gpt-reserve") {
+    const isTerra = baseSlug.includes("terra");
+    return {
+      context_window: 272_000,
+      reasoning: true,
+      supported_reasoning_levels: normalizeReasoningLevels(isTerra ? ["low", "medium", "high", "xhigh", "max", "ultra"] : ["low", "medium", "high", "xhigh", "max"]),
+      default_reasoning_level: "medium",
+      supports_vision: true,
+    };
+  }
+
+  return undefined;
+}
+
 /**
  * Read exact reasoning options when a provider or registry publishes them.
  * `undefined` means the source did not say; an empty array means it explicitly
@@ -209,15 +339,16 @@ export function extractModelVisionCapability(model: any): boolean | undefined {
 function withDefaultReasoningLevels(
   discovered: Array<{ effort: string; description?: string }>,
 ): Array<{ effort: string; description?: string }> {
-  const byEffort = new Map(discovered.map((level) => [level.effort, level]));
   const baseline = DEFAULT_REASONING_PRESETS.map((level) => ({ ...level }));
+  const hasMinimal = discovered.some((level) => level.effort === "minimal");
+  const prefix = hasMinimal ? [{ effort: "minimal", description: reasoningDescription("minimal") || "最小推理" }] : [];
   const extras = discovered
-    .filter((level) => !DEFAULT_REASONING_PRESETS.some((base) => base.effort === level.effort))
+    .filter((level) => level.effort !== "minimal" && !DEFAULT_REASONING_PRESETS.some((base) => base.effort === level.effort))
     .map((level) => ({
       ...level,
       description: reasoningDescription(level.effort) || level.description || `推理档位：${level.effort}`,
     }));
-  return [...baseline, ...extras];
+  return [...prefix, ...baseline, ...extras];
 }
 
 /**
@@ -235,6 +366,14 @@ function resolveModelReasoningLevels(model: any): Array<{ effort: string; descri
   // (some registries use that flag for a different reasoning capability).
   if (model?.reasoning === false) return discovered || [];
   if (discovered && discovered.length > 0) return withDefaultReasoningLevels(discovered);
+  const slug = String(model?.slug || model?.backend_model || model?.model || "").trim();
+  const knownSpec = getKnownModelSpec(slug);
+  if (knownSpec) {
+    if (knownSpec.reasoning === false) return [];
+    if (knownSpec.supported_reasoning_levels && knownSpec.supported_reasoning_levels.length > 0) {
+      return knownSpec.supported_reasoning_levels;
+    }
+  }
   return withDefaultReasoningLevels([]);
 }
 
@@ -242,7 +381,12 @@ export function applyDefaultReasoningCapabilities(model: any): any {
   const levels = resolveModelReasoningLevels(model);
   const result = { ...model, supported_reasoning_levels: levels };
   if (levels.length > 0) {
-    const defaultValue = model?.default_reasoning_level ?? model?.defaultReasoningEffort ?? model?.defaultReasoningLevel;
+    const slug = String(model?.slug || model?.backend_model || model?.model || "").trim();
+    const knownSpec = getKnownModelSpec(slug);
+    const defaultValue = model?.default_reasoning_level
+      ?? model?.defaultReasoningEffort
+      ?? model?.defaultReasoningLevel
+      ?? knownSpec?.default_reasoning_level;
     const requested = String(typeof defaultValue === "object"
       ? defaultValue?.effort || defaultValue?.reasoningEffort || ""
       : defaultValue || "").trim().toLowerCase();
@@ -459,12 +603,14 @@ export function buildFullCatalogEntry(
   const directContext = getActualContextWindow(modelSlug, apiContextWindow);
   const providerMetadataContext = getProviderReportedContextWindow(capabilities);
   const registryContext = getRegistryContextWindow(capabilities);
-  const reportedContext = directContext || providerMetadataContext;
-  // A matched model-registry record is the model's published capability, not
-  // an unknown-model guess. Only use the schema fallback when neither the
-  // provider nor the registry knows this model.
-  const catalogContext = reportedContext || registryContext || DEFAULT_CATALOG_CONTEXT_WINDOW;
-  const visionCapability = extractModelVisionCapability(capabilities);
+  const explicitContext = extractModelContextWindow(capabilities);
+  const reportedContext = directContext || providerMetadataContext || (capabilities?.context_window_source === "provider_metadata" ? explicitContext : undefined);
+  const knownSpec = getKnownModelSpec(modelSlug)
+    || getKnownModelSpec(capabilities?.backend_model || capabilities?.model || "");
+  // A matched model-registry record or known model spec is the model's published capability,
+  // not an unknown-model guess. Only use the schema fallback when neither knows this model.
+  const catalogContext = reportedContext || registryContext || knownSpec?.context_window || DEFAULT_CATALOG_CONTEXT_WINDOW;
+  const visionCapability = extractModelVisionCapability(capabilities) ?? knownSpec?.supports_vision;
   // `supports_vision` describes the provider model itself. `vision_bridge_enabled`
   // describes the gateway boundary: even a text-only provider can receive an
   // image here because the gateway can replace it with a native vision
@@ -472,8 +618,11 @@ export function buildFullCatalogEntry(
   // attachment to reach the gateway instead of rejecting the turn locally.
   const visionBridgeEnabled = true;
   const desktopAcceptsImageInput = visionCapability === true || visionBridgeEnabled;
-  const reasoningLevels = resolveModelReasoningLevels(capabilities);
-  const defaultValue = capabilities?.default_reasoning_level ?? capabilities?.defaultReasoningEffort ?? capabilities?.defaultReasoningLevel;
+  const reasoningLevels = resolveModelReasoningLevels(capabilities || { slug: modelSlug });
+  const defaultValue = capabilities?.default_reasoning_level
+    ?? capabilities?.defaultReasoningEffort
+    ?? capabilities?.defaultReasoningLevel
+    ?? knownSpec?.default_reasoning_level;
   const requestedDefaultReasoning = String(typeof defaultValue === "object"
     ? defaultValue?.effort || defaultValue?.reasoningEffort || ""
     : defaultValue || "").trim().toLowerCase();
@@ -486,7 +635,9 @@ export function buildFullCatalogEntry(
     ? "provider_metadata"
     : registryContext
       ? "model_registry"
-      : "unknown";
+      : knownSpec?.context_window
+        ? "provider_metadata"
+        : "unknown";
   const entry: any = {
     slug: modelSlug,
     model: modelSlug,
@@ -542,6 +693,7 @@ export function buildFullCatalogEntry(
     image_generation_mode: "native_images",
   };
   if (defaultReasoning) entry.default_reasoning_level = defaultReasoning;
+  if (knownSpec && knownSpec.reasoning === false) entry.reasoning = false;
   if (typeof capabilities?.reasoning === "boolean") entry.reasoning = capabilities.reasoning;
   return entry;
 }
@@ -739,14 +891,17 @@ export class CatalogSyncService {
     const registryMatch = findModelRegistryMatch(CatalogSyncService.readModelRegistryCache(), provider, modelSlug);
     const registry = registryMatch?.metadata;
     const desktopCache = codexModelCacheMetadata(modelSlug);
-    if (!explicit && !registry && !desktopCache) return undefined;
+    const knownSpec = getKnownModelSpec(modelSlug);
+    if (!explicit && !registry && !desktopCache && !knownSpec) return undefined;
     const explicitContext = extractModelContextWindow(explicit);
     const registryContext = extractModelContextWindow(registry);
+    const knownContext = knownSpec?.context_window;
     const explicitSource = contextWindowSource(explicit);
     const explicitContextIsLive = Boolean(explicitContext && explicitSource !== "model_registry" && explicitSource !== "unknown");
     const explicitLevels = extractModelReasoningLevels(explicit);
     const registryLevels = extractModelReasoningLevels(registry);
     const desktopLevels = extractModelReasoningLevels(desktopCache);
+    const knownLevels = knownSpec?.supported_reasoning_levels;
     const registrySource = registryMatch?.providerMatched ? "provider_metadata" : "model_registry";
     // The Desktop cache is derived and can contain an older third-party
     // projection. Keep its reasoning capabilities as a compatibility source,
@@ -763,6 +918,15 @@ export class CatalogSyncService {
     return {
       ...(registry && typeof registry === "object" ? registry : {}),
       ...(desktopCapabilities || {}),
+      ...(knownSpec ? {
+        context_window: knownContext,
+        max_context_window: knownContext,
+        context_window_source: "provider_metadata",
+        supported_reasoning_levels: knownLevels,
+        default_reasoning_level: knownSpec.default_reasoning_level,
+        ...(knownSpec.supports_vision !== undefined ? { supports_vision: knownSpec.supports_vision } : {}),
+        reasoning: knownSpec.reasoning,
+      } : {}),
       ...(explicit && typeof explicit === "object" ? explicit : {}),
       ...(explicitContextIsLive
         ? {
@@ -777,17 +941,27 @@ export class CatalogSyncService {
             max_context_window: registryContext,
             context_window_source: registrySource,
           }
-          : {}),
-      ...(explicitLevels !== undefined || desktopLevels !== undefined || registryLevels !== undefined
-        ? { supported_reasoning_levels: explicitLevels !== undefined ? explicitLevels : desktopLevels !== undefined ? desktopLevels : registryLevels }
+          : knownContext
+            ? {
+              context_window: knownContext,
+              max_context_window: knownContext,
+              context_window_source: "provider_metadata",
+            }
+            : {}),
+      ...(explicitLevels !== undefined || registryLevels !== undefined || knownLevels !== undefined || desktopLevels !== undefined
+        ? { supported_reasoning_levels: explicitLevels !== undefined ? explicitLevels : registryLevels !== undefined ? registryLevels : knownLevels !== undefined ? knownLevels : desktopLevels }
         : {}),
-      metadata_source: registryMatch?.providerMatched
+      metadata_source: explicitContextIsLive || explicitLevels !== undefined
         ? "provider_metadata"
-        : explicit?.metadata_source
-          ? explicit.metadata_source
-          : explicitContextIsLive || explicitLevels !== undefined || desktopLevels !== undefined
+        : registryMatch?.providerMatched
+          ? "provider_metadata"
+          : knownContext !== undefined
             ? "provider_metadata"
-            : registrySource,
+            : explicit?.metadata_source
+              ? explicit.metadata_source
+              : desktopLevels !== undefined
+                ? "provider_metadata"
+                : registrySource,
     };
   }
 

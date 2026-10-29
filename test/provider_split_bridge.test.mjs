@@ -295,24 +295,19 @@ test("native child routing is request-scoped and leaves the native provider unto
   assert.equal(shouldResolveSubagentRoute(true, false), true);
 
   const args = nativeRuntimeArgs(["--profile", "default", "app-server", "--listen", "stdio"], 43127);
-  assert.deepEqual(args.slice(0, 14), [
+  assert.deepEqual(args.slice(0, 8), [
     "--profile", "default",
-    "-c", "model_provider=opencodex",
-    "-c", "model_providers.opencodex.base_url=http://127.0.0.1:43127/v1",
-    "-c", "model_providers.opencodex.wire_api=responses",
-    "-c", "model_providers.opencodex.requires_openai_auth=false",
     "-c", "openai_base_url=http://127.0.0.1:43127/v1",
-    "-c", "chatgpt_base_url=http://127.0.0.1:43127/v1/backend-api/",
-  ]);
-  assert.deepEqual(args.slice(14, 22), [
     "-c", "experimental_realtime_webrtc_call_base_url=http://127.0.0.1:43127/v1",
     "-c", "experimental_realtime_ws_base_url=ws://127.0.0.1:43127/v1/realtime",
+  ]);
+  assert.deepEqual(args.slice(8, 12), [
     "-c", "features.responses_websockets=false",
     "-c", "features.responses_websockets_v2=false",
   ]);
   assert.equal(args.filter((value) => value.startsWith("experimental_realtime_")).length, 2);
-  assert.equal(args.includes("model_provider=opencodex"), true);
-  assert.equal(args[22], "app-server");
+  assert.equal(args.includes("model_provider=opencodex"), false);
+  assert.equal(args[12], "app-server");
 });
 
 test("native Live response ids can bind the following sideband to the same account", () => {
@@ -888,7 +883,7 @@ rl.on("line", (line) => { void handleLine(line); });
     assert.match(trace.websocketFallback.body, /Upgrade Required|upgrade_required/);
     assert.match(trace.argv.join(" "), /openai_base_url=http:\/\/127\.0\.0\.1:\d+\/__opencodex_(?:native_egress_)?[a-f0-9]+\/v1/);
     assert.match(trace.argv.join(" "), /features\.responses_websockets=false/);
-    assert.equal(trace.argv.some((value) => value.includes("model_provider=opencodex")), true);
+    assert.equal(trace.argv.some((value) => value.includes("model_provider=opencodex")), false);
   } finally {
     output.close();
     bridge.kill("SIGTERM");

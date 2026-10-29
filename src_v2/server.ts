@@ -20,6 +20,14 @@ const shutdown = () => {
 process.once("SIGTERM", shutdown);
 process.once("SIGINT", shutdown);
 
+process.on("unhandledRejection", (reason: any) => {
+  const isAbort = reason?.name === "AbortError" || reason?.code === 20 || String(reason?.message || "").includes("aborted");
+  if (isAbort) {
+    return;
+  }
+  console.error("[CodexSplit Gateway] Unhandled promise rejection:", reason);
+});
+
 function monitorDesktopParent(): void {
   // The packaged macOS shell owns this child through Process.terminate() and
   // its termination handler. A second kill(pid, 0) watchdog is redundant in

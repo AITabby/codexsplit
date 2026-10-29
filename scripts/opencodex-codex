@@ -16,10 +16,23 @@ while [ -L "$SCRIPT_PATH" ]; do
 done
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$SCRIPT_PATH")" && pwd)
 PROJECT_ROOT=$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)
-if [ -x "$PROJECT_ROOT/node" ]; then
+
+if [ -n "${OPENCODEX_PROVIDER_BRIDGE_NODE:-}" ] && [ -x "$OPENCODEX_PROVIDER_BRIDGE_NODE" ]; then
+  NODE="$OPENCODEX_PROVIDER_BRIDGE_NODE"
+elif [ -x "$PROJECT_ROOT/node" ]; then
   NODE="$PROJECT_ROOT/node"
+elif command -v node >/dev/null 2>&1; then
+  NODE=$(command -v node)
+elif [ -n "${HOME:-}" ] && [ -x "$HOME/.local/bin/node" ]; then
+  NODE="$HOME/.local/bin/node"
+elif [ -n "${HOME:-}" ] && [ -d "$HOME/.local/state/fnm_multishells" ] && [ -n "$(find "$HOME/.local/state/fnm_multishells" -name node -type f -perm +111 2>/dev/null | head -n 1)" ]; then
+  NODE=$(find "$HOME/.local/state/fnm_multishells" -name node -type f -perm +111 2>/dev/null | head -n 1)
+elif [ -x "/opt/homebrew/bin/node" ]; then
+  NODE="/opt/homebrew/bin/node"
+elif [ -x "/usr/local/bin/node" ]; then
+  NODE="/usr/local/bin/node"
 else
-  NODE=${OPENCODEX_PROVIDER_BRIDGE_NODE:-node}
+  NODE=node
 fi
 
 BRIDGE_JS=${OPENCODEX_PROVIDER_BRIDGE_JS:-$PROJECT_ROOT/dist/codex-provider-bridge.js}

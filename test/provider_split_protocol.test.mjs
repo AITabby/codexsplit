@@ -984,6 +984,86 @@ test("bringing the gateway back restores third-party turns without restarting th
   }
 });
 
+test("switching to a different third-party model after a failed third-party turn in the same thread is not hijacked to native default", async () => {
+  const tempRoot = await mkdtemp(join(tmpdir(), "opencodex-provider-bridge-switch-"));
+  const fakeNativePath = join(tempRoot, "fake-native-app-server.mjs");
+  const emptyCatalogPath = join(tempRoot, "empty-catalog.json");
+  const offlineMarker = join(tempRoot, "gateway-offline");
+  await writeFile(fakeNativePath, fakeNativeSource, "utf8");
+  await chmod(fakeNativePath, 0o755);
+  await writeFile(emptyCatalogPath, JSON.stringify({
+    models: [
+      { slug: "antigravity/gemini-4-argon", provider: "opencodex" },
+      { slug: "minimax/MiniMax-M3.1-Flash", provider: "opencodex" },
+    ],
+  }), "utf8");
+  await writeFile(offlineMarker, "offline", "utf8");
+
+  const bridgePath = fileURLToPath(new URL("../dist/codex-provider-bridge.js", import.meta.url));
+  const bridge = spawn(process.execPath, [bridgePath, "app-server"], {
+    env: {
+      ...process.env,
+      CODEX_CLI_PATH: "",
+      OPENCODEX_NATIVE_CODEX_PATH: fakeNativePath,
+      OPENCODEX_MODEL_CATALOG_PATH: emptyCatalogPath,
+      FAKE_GATEWAY_OFFLINE_FILE: offlineMarker,
+    },
+    stdio: ["pipe", "pipe", "pipe"],
+  });
+  const messages = [];
+  const output = readline.createInterface({ input: bridge.stdout });
+  output.on("line", (line) => {
+    if (!line.trim()) return;
+    try { messages.push(JSON.parse(line)); } catch {}
+  });
+
+  const send = (message) => bridge.stdin.write(`${JSON.stringify(message)}\n`);
+  try {
+    send({ id: 41, method: "initialize", params: {} });
+    assert.deepEqual(await waitForResponse(messages, 41), { id: 41, result: {} });
+
+    send({
+      id: 42,
+      method: "thread/settings/update",
+      params: { threadId: "thread-1", model: "antigravity/gemini-4-argon" },
+    });
+    assert.deepEqual(await waitForResponse(messages, 42), { id: 42, result: {} });
+
+    send({
+      id: 43,
+      method: "turn/start",
+      params: { threadId: "thread-1", model: "antigravity/gemini-4-argon", input: [] },
+    });
+    const failedTurn = await waitForResponse(messages, 43);
+    assert.equal(failedTurn.error.message, "OpenCodex gateway is unavailable");
+
+    // Gateway is back online.
+    await rm(offlineMarker);
+
+    // User switches to MiniMax in the same thread, sending modelProvider: "openai" as Desktop does:
+    send({
+      id: 44,
+      method: "turn/start",
+      params: {
+        threadId: "thread-1",
+        model: "minimax/MiniMax-M3.1-Flash",
+        modelProvider: "openai",
+        input: [],
+      },
+    });
+    const switchedTurn = await waitForResponse(messages, 44);
+    assert.equal(switchedTurn.error, undefined);
+    assert.equal(switchedTurn.result.thread.id, "thread-1");
+    assert.equal(switchedTurn.result.thread.model, "minimax/MiniMax-M3.1-Flash");
+    assert.equal(switchedTurn.result.thread.modelProvider, "opencodex");
+  } finally {
+    output.close();
+    bridge.kill("SIGTERM");
+    await once(bridge, "exit").catch(() => {});
+    await rm(tempRoot, { recursive: true, force: true });
+  }
+});
+
 test("a third-party image attachment keeps native Codex semantics and remains isolated", async () => {
   const tempRoot = await mkdtemp(join(tmpdir(), "opencodex-provider-bridge-image-isolation-"));
   const fakeNativePath = join(tempRoot, "fake-native-app-server.mjs");

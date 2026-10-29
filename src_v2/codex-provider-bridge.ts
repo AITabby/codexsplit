@@ -14,11 +14,13 @@ import http from "node:http";
 import os from "node:os";
 import path from "node:path";
 import { randomBytes } from "node:crypto";
+import { createConnection } from "node:net";
 import { fileURLToPath } from "node:url";
 import { execFileSync, spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { RequestDecompressor } from "./core/decompressor.js";
 import { isNativeControlPlaneModel, isOfficialModelSlug } from "./core/model_identity.js";
 export { isOfficialModelSlug };
+import { sanitizeNativeResponsesBody } from "./core/responses_safety.js";
 import { copySafeResponseHeaders, writeHttpResponseChunked } from "./services/http_stream.js";
 import { fetchUpstream, upstreamErrorDetails } from "./services/upstream_fetch.js";
 import { normalizeLegacyTurnInput } from "./services/image_input.js";
@@ -973,6 +975,100 @@ function configuredGatewayPort(): number {
   return 8765;
 }
 
+function gatewayServerScriptPath(): string {
+  try {
+    const currentDir = path.dirname(fileURLToPath(import.meta.url));
+    const candidate1 = path.join(currentDir, "server.js");
+    if (fs.existsSync(candidate1)) return candidate1;
+  } catch {}
+  const candidate2 = path.join(process.cwd(), "dist", "server.js");
+  if (fs.existsSync(candidate2)) return candidate2;
+  return "";
+}
+
+async function isGatewayHealthy(port: number): Promise<boolean> {
+  try {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 1000);
+    const res = await fetch(`http://127.0.0.1:${port}/health`, { signal: controller.signal });
+    clearTimeout(timer);
+    return res.status < 500;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * A plain TCP probe is enough to decide whether a listener already owns the
+ * gateway port. Probing with HTTP would send an unexpected GET to whatever is
+ * listening (for example a test double), so keep the auto-start check
+ * transport-neutral and only fall back to the HTTP health check while waiting
+ * for a freshly spawned daemon.
+ */
+async function isPortListening(port: number): Promise<boolean> {
+  return new Promise((resolve) => {
+    const socket = createConnection({ host: "127.0.0.1", port });
+    let settled = false;
+    const finish = (listening: boolean) => {
+      if (settled) return;
+      settled = true;
+      socket.destroy();
+      resolve(listening);
+    };
+    socket.setTimeout(800, () => finish(false));
+    socket.once("connect", () => finish(true));
+    socket.once("error", () => finish(false));
+  });
+}
+
+function isTestEnvironment(): boolean {
+  return process.env.NODE_ENV === "test" || Boolean(process.env.OPENCODEX_TEST) || process.argv.some((a) => a.includes("test"));
+}
+
+let gatewayDaemonStarting: Promise<boolean> | null = null;
+
+async function ensureGatewayDaemonRunning(): Promise<boolean> {
+  const port = configuredGatewayPort();
+  if (await isPortListening(port)) return true;
+  if (isTestEnvironment()) return false;
+  if (gatewayDaemonStarting) return gatewayDaemonStarting;
+
+  const script = gatewayServerScriptPath();
+  if (!script) return false;
+
+  gatewayDaemonStarting = (async () => {
+    try {
+      console.error(`[OpenCodex Bridge] Spawning background gateway daemon on port ${port}...`);
+      const projectRoot = path.dirname(path.dirname(script));
+      const logDir = opencodexDataDir();
+      fs.mkdirSync(logDir, { recursive: true });
+      const logPath = path.join(logDir, "gateway.log");
+      const logFd = fs.openSync(logPath, "a");
+      const child = spawn(process.execPath, [script], {
+        cwd: projectRoot,
+        detached: true,
+        stdio: ["ignore", logFd, logFd],
+        env: { ...process.env, PORT: String(port) },
+      });
+      child.unref();
+      for (let i = 0; i < 20; i++) {
+        await new Promise((r) => setTimeout(r, 200));
+        if (await isGatewayHealthy(port)) {
+          console.error(`[OpenCodex Bridge] Gateway daemon successfully started on port ${port}.`);
+          return true;
+        }
+      }
+    } catch (err: any) {
+      console.error(`[OpenCodex Bridge] Failed to spawn gateway daemon: ${err?.message || String(err)}`);
+    } finally {
+      gatewayDaemonStarting = null;
+    }
+    return false;
+  })();
+
+  return gatewayDaemonStarting;
+}
+
 function providerBridgeAdminToken(): string {
   const configured = cleanString(process.env.OPENCODEX_ADMIN_TOKEN);
   if (configured) return configured;
@@ -1441,6 +1537,9 @@ async function handleNativeEgressRequest(
     : classifyRuntimeModel(selectedModel) === GATEWAY_PROVIDER
       ? "gateway"
       : nativeEgressRoute(parsedBody, req.headers);
+  if (route === "gateway" && !nativeLiveCall) {
+    await ensureGatewayDaemonRunning();
+  }
   const routedBody = route === "gateway" && selectedModel && modelSlug(parsedBody.model) !== selectedModel
     ? { ...parsedBody, model: selectedModel }
     : parsedBody;
@@ -1449,6 +1548,11 @@ async function handleNativeEgressRequest(
     && rewrittenGatewayBody !== parsedBody
     ? Buffer.from(JSON.stringify(rewrittenGatewayBody), "utf8")
     : body;
+  let nativeBody = body;
+  if (route === "native" && !nativeLiveCall && (endpoint === "/responses" || endpoint === "/responses/compact")) {
+    const sanitized = sanitizeNativeResponsesBody(parsedBody);
+    nativeBody = Buffer.from(JSON.stringify(sanitized.body), "utf8");
+  }
   const targetUrl = nativeLiveCall
     ? nativeLiveCallTarget(requestUrl.search)
     : route === "gateway"
@@ -1476,11 +1580,19 @@ async function handleNativeEgressRequest(
       },
     }
     : undefined;
+  const nativeRequestPreparation = route === "native" && !nativeLiveCall
+    ? {
+      prepareRequest: (credential: OfficialAccountCredential | null) => {
+        const headers = localEgressHeaders(req, credential);
+        return { headers, body: nativeBody };
+      },
+    }
+    : undefined;
   await proxyNativeEgressRequest(
     req,
     res,
     targetUrl,
-    body,
+    route === "native" ? nativeBody : (route === "gateway" ? gatewayBody : body),
     `native-${nativeLiveCall ? "live" : route}-${endpoint.replace(/^\//, "") || "root"}`,
     // Account takeover is an HTTP-header concern; keep the original upstream
     // transport so enabling the pool cannot change native connection behavior.
@@ -1506,7 +1618,7 @@ async function handleNativeEgressRequest(
       onResponseBody: (responseBody, credential, response) => {
         if (response.status < 400) liveBindings.remember(responseBody, response, credential);
       },
-    } : gatewayRequestPreparation,
+    } : (route === "gateway" ? gatewayRequestPreparation : nativeRequestPreparation),
   );
 }
 
@@ -1747,11 +1859,19 @@ async function handleCliEgressRequest(
   }
   const nativeLiveCall = isNativeLiveCreateCall(requestUrl.pathname, basePath);
   const route = nativeLiveCall ? "native" : cliEgressRoute(parsedBody, req.headers);
+  if (route === "gateway" && !nativeLiveCall) {
+    await ensureGatewayDaemonRunning();
+  }
   const rewrittenGatewayBody = rewriteNativeGatewayRequestBody(parsedBody, req.headers);
   const gatewayBody = route === "gateway" && !nativeLiveCall
     && rewrittenGatewayBody !== parsedBody
     ? Buffer.from(JSON.stringify(rewrittenGatewayBody), "utf8")
     : body;
+  let cliNativeBody = body;
+  if (route === "native" && !nativeLiveCall && (endpoint === "/responses" || endpoint === "/responses/compact")) {
+    const sanitized = sanitizeNativeResponsesBody(parsedBody);
+    cliNativeBody = Buffer.from(JSON.stringify(sanitized.body), "utf8");
+  }
   const targetUrl = nativeLiveCall
     ? nativeLiveCallTarget(requestUrl.search)
     : route === "gateway"
@@ -1791,7 +1911,7 @@ async function handleCliEgressRequest(
     req,
     res,
     targetUrl,
-    gatewayBody,
+    route === "native" ? cliNativeBody : gatewayBody,
     `cli-${route}-${endpoint.replace(/^\//, "") || "root"}`,
     // The CLI account router also changes only the credential, not transport.
     "undici",
@@ -1855,18 +1975,9 @@ export function nativeRuntimeArgs(args: string[], egressPort: number, egressBase
   // `/live/<call_id>` sideband path before the local egress handles Upgrade.
   const nativeRealtimeWebSocketBaseUrl = `ws://127.0.0.1:${egressPort}${egressBasePath}/realtime`;
   const overrides = [
-    // Force the native child onto an OpenAI-compatible provider so even the
-    // Desktop app-server's ChatGPT-account path crosses this local Egress.
-    // Egress still decides per request whether the model is official (native
-    // account) or provider-owned (CodexSplit gateway).
-    "-c", `model_provider=${NATIVE_EGRESS_PROVIDER}`,
-    "-c", `model_providers.${NATIVE_EGRESS_PROVIDER}.base_url=${nativeEgressBaseUrl}`,
-    "-c", `model_providers.${NATIVE_EGRESS_PROVIDER}.wire_api=responses`,
-    "-c", `model_providers.${NATIVE_EGRESS_PROVIDER}.requires_openai_auth=false`,
-    // Keep the legacy OpenAI base override too for child revisions that read
-    // it before resolving the configured provider.
+    // Keep ordinary Responses/API traffic on the local Egress so account
+    // selection and provider-owned task routing remain request-scoped.
     "-c", `openai_base_url=${nativeEgressBaseUrl}`,
-    "-c", `chatgpt_base_url=${nativeEgressBaseUrl}/backend-api/`,
     // Live also crosses this Egress as a transparent native transport. The
     // HTTP call creation and WebSocket sideband have separate settings; the
     // latter must use ws:// so the runtime performs a real Upgrade instead of
@@ -2057,17 +2168,26 @@ function nativeCliPath(): string {
 
 function isAppServerInvocation(args: string[]): boolean {
   const index = args.indexOf("app-server");
-  return index >= 0 && args[index + 1] !== "daemon";
+  if (index < 0) return false;
+  if (args[index + 1] === "daemon") return false;
+  if (args.includes("--print-startup-config") || args.includes("--version") || args.includes("-V") || args.includes("--help") || args.includes("-h")) {
+    return false;
+  }
+  return true;
 }
 
 function passthroughNative(args: string[]): void {
+  const cleanEnv = { ...process.env };
+  delete cleanEnv.CODEX_CLI_PATH;
+  delete cleanEnv.OPENCODEX_PROVIDER_BRIDGE_PATH;
+  delete cleanEnv.OPENCODEX_PROVIDER_BRIDGE_RUNTIME;
   const native = spawn(nativeCodexPath(), args, {
-    env: { ...process.env, CODEX_CLI_PATH: undefined },
+    env: cleanEnv,
     stdio: "inherit",
   });
   native.once("exit", (code, signal) => {
     if (signal) process.kill(process.pid, signal);
-    else process.exit(code ?? 1);
+    else process.exit(code ?? 0);
   });
 }
 
@@ -2111,9 +2231,10 @@ async function runCliProviderBridge(args: string[]): Promise<void> {
   const finish = async (code: number | null, signal: NodeJS.Signals | null, error?: Error): Promise<void> => {
     if (finished) return;
     finished = true;
+    try { process.stdin.destroy(); } catch {}
     if (error) console.error(`[OpenCodex CLI Egress] native CLI failed: ${error.message}`);
     await closeEgress();
-    process.exitCode = signal ? 1 : (code ?? 1);
+    process.exit(signal ? 1 : (code ?? 0));
   };
   process.once("SIGINT", onSignal);
   process.once("SIGTERM", onSignal);
@@ -2121,6 +2242,7 @@ async function runCliProviderBridge(args: string[]): Promise<void> {
     void finish(1, null, error);
   });
   native.once("exit", (code, signal) => {
+    try { process.stdin.destroy(); } catch {}
     void finish(code, signal);
   });
 }
@@ -2503,20 +2625,7 @@ async function runProviderBridge(): Promise<void> {
     const explicit = modelFromPayload(params);
     const pending = pendingSelectedModels.get(route.externalId);
     const explicitProvider = explicit ? providerForModel(explicit) : null;
-    // A model change is committed by thread/settings/update. Desktop can
-    // echo the native physical provider on a later turn even when this local
-    // route is bound to a third-party model; that transport detail must not
-    // erase the durable selected model after a restart.
-    if (explicit && explicitProvider === NATIVE_PROVIDER) return explicit;
-    if (
-      failedProviderRoutes.has(route.externalId)
-      && normalizeProvider(params.modelProvider) === NATIVE_PROVIDER
-    ) {
-      // After a failed provider request, Desktop may send the next turn with
-      // only the native provider marker. Treat that as the user's escape back
-      // to native GPT, but do not apply the same heuristic after a restart.
-      return nativeDefaultModel();
-    }
+
     // The picker can race its settings/update acknowledgement: the next
     // turn may still carry the old provider-owned slug while the committed
     // model is already native. Preserve the explicit settings boundary in
@@ -2529,10 +2638,27 @@ async function runProviderBridge(): Promise<void> {
       && explicitProvider === GATEWAY_PROVIDER
       && normalizeProvider(params.modelProvider) === GATEWAY_PROVIDER
     ) {
+      failedProviderRoutes.delete(route.externalId);
       return pending;
     }
-    if (explicit) return explicit;
-    if (pending) return pending;
+    if (explicit) {
+      failedProviderRoutes.delete(route.externalId);
+      return explicit;
+    }
+    if (
+      failedProviderRoutes.has(route.externalId)
+      && normalizeProvider(params.modelProvider) === NATIVE_PROVIDER
+    ) {
+      // After a failed provider request, Desktop may send the next turn with
+      // only the native provider marker. Treat that as the user's escape back
+      // to native GPT, but do not apply the same heuristic after a restart.
+      failedProviderRoutes.delete(route.externalId);
+      return nativeDefaultModel();
+    }
+    if (pending) {
+      failedProviderRoutes.delete(route.externalId);
+      return pending;
+    }
     return route.selectedModel || nativeDefaultModel();
   }
 
@@ -3407,27 +3533,6 @@ async function runProviderBridge(): Promise<void> {
       : Object.fromEntries(
           Object.entries(originalMetadata).filter(([key]) => key !== "opencodex_model_override"),
         );
-    if (selectedProvider === GATEWAY_PROVIDER) {
-      try {
-        const dbPath = path.join(codexHomeDir(), "state_5.sqlite");
-        if (fs.existsSync(dbPath)) {
-          execFileSync("sqlite3", [
-            dbPath,
-            `UPDATE threads SET model_provider = 'opencodex' WHERE id = '${physicalThreadId}' AND model_provider != 'opencodex';`,
-          ], { stdio: "ignore" });
-        }
-      } catch {}
-    } else {
-      try {
-        const dbPath = path.join(codexHomeDir(), "state_5.sqlite");
-        if (fs.existsSync(dbPath)) {
-          execFileSync("sqlite3", [
-            dbPath,
-            `UPDATE threads SET model_provider = 'openai' WHERE id = '${physicalThreadId}' AND model_provider != 'openai';`,
-          ], { stdio: "ignore" });
-        }
-      } catch {}
-    }
     const nextParams = rewriteNativeTransportModel(
       applyRequestProvider({
         ...originalParams,
@@ -3488,17 +3593,6 @@ async function runProviderBridge(): Promise<void> {
         threadSource: threadSource(params) || undefined,
         threadOrigin: threadOrigin(params),
       });
-      if (isThirdParty) {
-        try {
-          const dbPath = path.join(codexHomeDir(), "state_5.sqlite");
-          if (fs.existsSync(dbPath)) {
-            execFileSync("sqlite3", [
-              dbPath,
-              `UPDATE threads SET model_provider = 'opencodex' WHERE id = '${nativeId}' AND model_provider != 'opencodex';`,
-            ], { stdio: "ignore" });
-          }
-        } catch {}
-      }
     }
     const childDisplay = nativeId
       ? nativeSubagentDisplaySettings.get(nativeId) || (route ? nativeDisplaySettingsForRoute(route, nativeId) : undefined)
@@ -3671,14 +3765,15 @@ async function runProviderBridge(): Promise<void> {
     const thirdParty = providerForModel(selected) === GATEWAY_PROVIDER;
     const native = ensureRuntime(NATIVE_PROVIDER);
     const nextParams = rewriteNativeTransportModel(
-      applyRequestProvider({
-        ...params,
+      {
+        ...stripRequestProvider(params),
         // Keep a provider-owned start durable in the native Codex store. The
         // selected provider is request routing metadata; it is not a second
         // app-server or a separate conversation record.
         ...(thirdParty ? { ephemeral: false } : {}),
         model: physicalModel,
-      }, NATIVE_EGRESS_PROVIDER),
+        modelProvider: NATIVE_PROVIDER,
+      },
       physicalModel,
       thirdParty,
     );
@@ -3692,16 +3787,6 @@ async function runProviderBridge(): Promise<void> {
           const thread = result.thread && typeof result.thread === "object" ? result.thread as JsonRecord : {};
           const nativeId = threadIdFrom(thread.id);
           if (nativeId) {
-            try {
-              const dbPath = path.join(codexHomeDir(), "state_5.sqlite");
-              if (fs.existsSync(dbPath)) {
-                const targetProvider = thirdParty ? "opencodex" : "openai";
-                execFileSync("sqlite3", [
-                  dbPath,
-                  `UPDATE threads SET model_provider = '${targetProvider}' WHERE id = '${nativeId}' AND model_provider != '${targetProvider}';`,
-                ], { stdio: "ignore" });
-              }
-            } catch {}
             const route = saveRoute({
               externalId: nativeId,
               nativeId,
@@ -3767,27 +3852,6 @@ async function runProviderBridge(): Promise<void> {
       route.parentThreadId = parentThreadId(params) || route.parentThreadId;
       rememberSettings(route, params);
       saveRoute(route);
-      if (providerForModel(selected) === GATEWAY_PROVIDER) {
-        try {
-          const dbPath = path.join(codexHomeDir(), "state_5.sqlite");
-          if (fs.existsSync(dbPath)) {
-            execFileSync("sqlite3", [
-              dbPath,
-              `UPDATE threads SET model_provider = 'opencodex' WHERE id = '${route.nativeId}' AND model_provider != 'opencodex';`,
-            ], { stdio: "ignore" });
-          }
-        } catch {}
-      } else {
-        try {
-          const dbPath = path.join(codexHomeDir(), "state_5.sqlite");
-          if (fs.existsSync(dbPath)) {
-            execFileSync("sqlite3", [
-              dbPath,
-              `UPDATE threads SET model_provider = 'openai' WHERE id = '${route.nativeId}' AND model_provider != 'openai';`,
-            ], { stdio: "ignore" });
-          }
-        } catch {}
-      }
       const native = nativeRuntimeForRoute(route);
       const childDisplay = nativeDisplaySettingsForRoute(route);
       let archiveRepairAttempted = false;
@@ -3818,7 +3882,7 @@ async function runProviderBridge(): Promise<void> {
           ...params,
           threadId: route.nativeId,
           model: nativeModel({}, route),
-        }, NATIVE_EGRESS_PROVIDER);
+        }, providerForModel(selected) === GATEWAY_PROVIDER ? NATIVE_EGRESS_PROVIDER : NATIVE_PROVIDER);
         delete nextParams.config;
         delete nextParams.path;
         if (route.nativePath) nextParams.path = route.nativePath;
@@ -4188,15 +4252,6 @@ async function runProviderBridge(): Promise<void> {
       saveRoute(route);
       const isOfficialNativeModel = classifyRuntimeModel(selected) === NATIVE_PROVIDER;
       if (!isOfficialNativeModel || providerForModel(selected) === GATEWAY_PROVIDER) {
-        try {
-          const dbPath = path.join(codexHomeDir(), "state_5.sqlite");
-          if (fs.existsSync(dbPath)) {
-            execFileSync("sqlite3", [
-              dbPath,
-              `UPDATE threads SET model_provider = 'opencodex' WHERE id = '${route.nativeId}' AND model_provider != 'opencodex';`,
-            ], { stdio: "ignore" });
-          }
-        } catch {}
         writeParent({ id: message.id, result: {} });
         // Desktop can echo the native child default (low) immediately after
         // the gateway has selected the Profile's effort. Once the resolved
@@ -4213,21 +4268,8 @@ async function runProviderBridge(): Promise<void> {
         emitSyntheticSettings(route.externalId, selected, selectedEffort || undefined);
         return;
       }
-      try {
-        const dbPath = path.join(codexHomeDir(), "state_5.sqlite");
-        if (fs.existsSync(dbPath)) {
-          execFileSync("sqlite3", [
-            dbPath,
-            `UPDATE threads SET model_provider = 'openai' WHERE id = '${route.nativeId}' AND model_provider != 'openai';`,
-          ], { stdio: "ignore" });
-        }
-      } catch {}
       const native = nativeRuntimeForRoute(route);
-      const nextParams = applyRequestProvider({
-        ...params,
-        threadId: route.nativeId,
-        model: selected,
-      }, NATIVE_PROVIDER);
+      const nextParams = { ...stripRequestProvider(params), threadId: route.nativeId, model: selected };
       sendParent(native, message, "thread/settings/update", nextParams, {
         externalThreadId: route.externalId,
         physicalThreadId: route.nativeId,
@@ -4268,6 +4310,7 @@ async function runProviderBridge(): Promise<void> {
         }
       }
       route.selectedModel = selected;
+      failedProviderRoutes.delete(route.externalId);
       rememberSettings(route, params);
       persistRequestedReasoningEffort(route, params);
       saveRoute(route);

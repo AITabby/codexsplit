@@ -29,6 +29,7 @@ import { CatalogSyncService, getProviderModelVisionCapability } from "../service
 import { CredentialStore } from "../services/credential_store.js";
 import { resolveSubscriptionTransport } from "../services/provider_transports.js";
 import { bindResponseAbort, linkAbortSignal, readWithAbortAndTimeout } from "../services/request_lifecycle.js";
+import { streamOpencodeChat } from "../services/opencode_transport.js";
 
 export class ProviderCredentialError extends Error {
   public readonly statusCode: number;
@@ -1925,6 +1926,11 @@ export class GatewayRouter {
       finalTargetUrl = subscriptionTransport!.endpoint;
     }
 
+    // OpenCode Free Subscription Routing
+    const isOpencodeModel = (subscriptionTransport?.id === "opencode" || upstreamModel.startsWith("opencode/"))
+      && (!apiKey || apiKey === "opencode-cli-auto")
+      && !isAntigravityModel && !isGrokModel && !isClaudeModel && !isCursorModel;
+
     // Ask OpenAI-compatible Chat endpoints for their actual stream usage when
     // supported. This is optional metadata; providers that omit it still work
     // and the Responses engine will simply leave usage absent.
@@ -2243,6 +2249,15 @@ export class GatewayRouter {
             },
           );
         })();
+      } else if (isOpencodeModel) {
+        response = await streamOpencodeChat(
+          optimizedChatBody.messages,
+          upstreamModel,
+          {
+            reasoningEffort: String(reqBody?.reasoning?.effort || reqBody?.reasoning_effort || "").trim() || undefined,
+          },
+          controller.signal,
+        );
       } else {
         response = await fetchUpstream(finalTargetUrl, {
           method: "POST",
@@ -3020,7 +3035,7 @@ export class GatewayRouter {
       return { completed: true, output: engine.getMessageText().trim() };
     } catch (err: any) {
       if (err instanceof ProviderCredentialError) throw err;
-      controller.abort();
+      try { controller.abort(); } catch {}
       const upstreamDetails = upstreamErrorDetails(err);
       console.error(`[CodexBridge V2] Stream error for ${finalTargetUrl}:`, {
         stack: err.stack,

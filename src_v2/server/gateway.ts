@@ -16,9 +16,10 @@ import { GatewayRouter, type GatewaySubagentDispatchCall, type GatewaySubagentDi
 import { clearProviderModelSelections, CredentialStore } from "../services/credential_store.js";
 import { RequestDecompressor } from "../core/decompressor.js";
 import { isNativeControlPlaneModel, isOfficialModelSlug } from "../core/model_identity.js";
-import { applyDefaultReasoningCapabilities, CatalogSyncService, buildFullCatalogEntry, getDefaultReasoningPresets } from "../services/catalog_sync.js";
+import { applyDefaultReasoningCapabilities, CatalogSyncService, buildFullCatalogEntry, getDefaultReasoningPresets, getKnownModelSpec } from "../services/catalog_sync.js";
 import { SubscriptionAuthService } from "../services/subscription_auth.js";
 import { fetchCursorModels } from "../services/cursor_protocol.js";
+import { fetchOpencodeModelsDynamic, findOpencodeCliPath, testOpencodeModel, BUILTIN_OPENCODE_FREE_MODELS } from "../services/opencode_transport.js";
 import { getAntigravityUserAgent, getClaudeDesktopVersion, getCursorClientVersion, getGrokUserAgent } from "../services/subscription_auth.js";
 import { copyNativeRequestHeaders, handleWebRtcProxy, normalizeNativeLiveCallBody, readNativeAccountCredential, resolveRealtimeUpstream } from "./webrtc_proxy.js";
 import { ProviderConfig, ProviderModelTestState } from "../core/types.js";
@@ -773,6 +774,11 @@ export function buildDesktopLaunchEnvironment(
     environment.CODEX_CLI_PATH = bridgePath;
     environment.OPENCODEX_NATIVE_CODEX_PATH = nativeCodexPath;
     environment.OPENCODEX_PROVIDER_BRIDGE_PATH = bridgePath;
+    environment.OPENCODEX_PROVIDER_BRIDGE_NODE = process.execPath;
+    const nodeDir = path.dirname(process.execPath);
+    if (!String(environment.PATH || "").includes(nodeDir)) {
+      environment.PATH = `${nodeDir}:${environment.PATH || "/usr/bin:/bin:/usr/sbin:/sbin"}`;
+    }
     environment.OPENCODEX_PROVIDER_SPLIT = "1";
     // Desktop's app-server can overwrite the startup HTTP transport with its
     // own thread config. The JSON-RPC supervisor rewrites provider turns to a
@@ -1427,6 +1433,47 @@ function recordSubscriptionTest(dataDir: string, providerName: string, status: P
   fs.chmodSync(statePath, 0o600);
 }
 
+export interface ModelTestState {
+  status: ProviderTestStatus;
+  tested_at?: string;
+  message?: string;
+}
+
+function modelTestStatusPath(dataDir: string): string {
+  return path.join(dataDir, "model_test_status.json");
+}
+
+function loadModelTestStatus(dataDir: string): Record<string, ModelTestState> {
+  const filePath = modelTestStatusPath(dataDir);
+  try {
+    const raw = fs.readFileSync(filePath, "utf-8");
+    const parsed = JSON.parse(raw);
+    return parsed && typeof parsed === "object" ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
+function recordModelTestStatus(
+  dataDir: string,
+  modelSlug: string,
+  status: ProviderTestStatus,
+  message: string,
+): ModelTestState {
+  fs.mkdirSync(dataDir, { recursive: true, mode: 0o700 });
+  const statuses = loadModelTestStatus(dataDir);
+  const state: ModelTestState = {
+    status,
+    tested_at: new Date().toISOString(),
+    message: String(message || "").slice(0, 500),
+  };
+  statuses[modelSlug] = state;
+  const filePath = modelTestStatusPath(dataDir);
+  fs.writeFileSync(filePath, JSON.stringify(statuses, null, 2), { encoding: "utf-8", mode: 0o600 });
+  try { fs.chmodSync(filePath, 0o600); } catch {}
+  return state;
+}
+
 
 function catalogModelOwner(model: any): string {
   const owner = normalizeNamespace(String(model?.backend_provider || model?.provider_name || ""));
@@ -1762,19 +1809,25 @@ export function preserveOfficialModels(catalog: any): void {
     const backendMetadata = configuredProvider
       ? CatalogSyncService.getKnownModelMetadata(configuredProvider, backendModel)
       : undefined;
+    const knownSpec = getKnownModelSpec(backendModel) || getKnownModelSpec(rawSlug) || getKnownModelSpec(alias);
     const existingReasoningLevels = Array.isArray(model.supported_reasoning_levels)
       ? model.supported_reasoning_levels
       : [];
     const legacyDefaultReasoning = JSON.stringify(existingReasoningLevels.map((level: any) => String(level?.effort || "").toLowerCase()))
       === JSON.stringify(getDefaultReasoningPresets().map((level) => level.effort));
-    const discoveredReasoningLevels = backendMetadata
-      ? backendMetadata.supported_reasoning_levels
-      : undefined;
+    const discoveredReasoningLevels = backendMetadata?.supported_reasoning_levels || knownSpec?.supported_reasoning_levels;
     const capabilities = {
       // Registry metadata may fill descriptive capabilities, but it must not
       // replace a context window previously verified by the active provider.
       ...model,
       ...(backendMetadata || {}),
+      ...(knownSpec ? {
+        context_window: model.context_window && (model.context_window !== 200_000 || model.context_window_source === "model_registry") ? model.context_window : knownSpec.context_window,
+        max_context_window: model.max_context_window && (model.max_context_window !== 200_000 || model.context_window_source === "model_registry") ? model.max_context_window : knownSpec.context_window,
+        context_window_source: model.context_window_source && model.context_window_source !== "unknown" ? model.context_window_source : "provider_metadata",
+        supported_reasoning_levels: existingReasoningLevels.length > 0 && !legacyDefaultReasoning ? existingReasoningLevels : knownSpec.supported_reasoning_levels,
+        default_reasoning_level: model.default_reasoning_level || knownSpec.default_reasoning_level,
+      } : {}),
       ...(existingReasoningLevels.length > 0
         && !legacyDefaultReasoning
         ? { supported_reasoning_levels: existingReasoningLevels }
@@ -1862,6 +1915,10 @@ function hasClaudeCredential(): boolean {
 
 function hasCursorCredential(): boolean {
   return SubscriptionAuthService.hasCursorCredential();
+}
+
+function hasOpencodeCredential(): boolean {
+  return SubscriptionAuthService.hasOpencodeCredential();
 }
 
 function hasCatalogModelsForProvider(catalogModels: any[], providerName: string): boolean {
@@ -1966,6 +2023,33 @@ function normalizeStoredFunctionCallId(record: any): boolean {
   return true;
 }
 
+function normalizeStoredMessageId(record: any): boolean {
+  const payload = record?.type === "response_item" ? record.payload : record;
+  if (!payload) return false;
+  let changed = false;
+
+  if ((payload.type === "message" || payload.role) && typeof payload.id === "string") {
+    if (!payload.id.startsWith("msg")) {
+      const safe = payload.id.replace(/_msg(?:_\d+)?$/i, "").replace(/^_+/, "");
+      payload.id = `msg_${safe || "import"}`;
+      changed = true;
+    }
+  }
+
+  if (record?.type === "event_msg" && record.payload?.item && typeof record.payload.item.id === "string") {
+    const item = record.payload.item;
+    if (item.type === "AgentMessage" || item.type === "UserMessage" || item.type === "message") {
+      if (!item.id.startsWith("msg")) {
+        const safe = item.id.replace(/_msg(?:_\d+)?$/i, "").replace(/^_+/, "");
+        item.id = `msg_${safe || "import"}`;
+        changed = true;
+      }
+    }
+  }
+
+  return changed;
+}
+
 /**
  * Remove only gateway-created reasoning records before native mode resumes.
  * Native Responses reasoning records carry server-managed encrypted content;
@@ -1978,13 +2062,25 @@ export function repairDatabaseThreads(): void {
     if (fs.existsSync(dbPath)) {
       execFileSync("sqlite3", [
         dbPath,
+        "DROP TRIGGER IF EXISTS opencodex_auto_provider_insert;" +
+        "DROP TRIGGER IF EXISTS opencodex_auto_provider_update;" +
+        "DROP TRIGGER IF EXISTS opencodex_auto_provider_revert_insert;" +
+        "DROP TRIGGER IF EXISTS opencodex_auto_provider_revert_update;" +
         "UPDATE threads SET model_provider = 'opencodex' WHERE model_provider != 'opencodex' AND (model LIKE '%/%' OR model LIKE '%gemini%' OR model LIKE '%minimax%' OR model LIKE '%claude%' OR model LIKE '%deepseek%' OR model LIKE '%qwen%');" +
-        "UPDATE threads SET model_provider = 'openai' WHERE model_provider != 'openai' AND (model LIKE 'gpt-%' OR model LIKE 'o3%' OR model LIKE 'o1%' OR model LIKE 'codex%');" +
-        "CREATE TRIGGER IF NOT EXISTS opencodex_auto_provider_insert AFTER INSERT ON threads FOR EACH ROW WHEN NEW.model_provider = 'openai' AND (NEW.model LIKE '%/%' OR NEW.model LIKE '%gemini%' OR NEW.model LIKE '%minimax%' OR NEW.model LIKE '%claude%' OR NEW.model LIKE '%deepseek%' OR NEW.model LIKE '%qwen%') BEGIN UPDATE threads SET model_provider = 'opencodex' WHERE id = NEW.id; END;" +
-        "CREATE TRIGGER IF NOT EXISTS opencodex_auto_provider_update AFTER UPDATE OF model ON threads FOR EACH ROW WHEN NEW.model_provider = 'openai' AND (NEW.model LIKE '%/%' OR NEW.model LIKE '%gemini%' OR NEW.model LIKE '%minimax%' OR NEW.model LIKE '%claude%' OR NEW.model LIKE '%deepseek%' OR NEW.model LIKE '%qwen%') BEGIN UPDATE threads SET model_provider = 'opencodex' WHERE id = NEW.id; END;" +
-        "CREATE TRIGGER IF NOT EXISTS opencodex_auto_provider_revert_insert AFTER INSERT ON threads FOR EACH ROW WHEN NEW.model_provider = 'opencodex' AND (NEW.model LIKE 'gpt-%' OR NEW.model LIKE 'o3%' OR NEW.model LIKE 'o1%' OR NEW.model LIKE 'codex%') BEGIN UPDATE threads SET model_provider = 'openai' WHERE id = NEW.id; END;" +
-        "CREATE TRIGGER IF NOT EXISTS opencodex_auto_provider_revert_update AFTER UPDATE OF model ON threads FOR EACH ROW WHEN NEW.model_provider = 'opencodex' AND (NEW.model LIKE 'gpt-%' OR NEW.model LIKE 'o3%' OR NEW.model LIKE 'o1%' OR NEW.model LIKE 'codex%') BEGIN UPDATE threads SET model_provider = 'openai' WHERE id = NEW.id; END;",
+        "UPDATE threads SET model_provider = 'openai' WHERE model_provider != 'openai' AND (model LIKE 'gpt-%' OR model LIKE 'o3%' OR model LIKE 'o1%' OR model LIKE 'codex%');",
       ], { stdio: "ignore" });
+    }
+    const historyDbPath = path.join(codexHomeDir(), "thread_history_1.sqlite");
+    if (fs.existsSync(historyDbPath)) {
+      try {
+        execFileSync("sqlite3", [
+          historyDbPath,
+          "UPDATE thread_items SET " +
+          "  item_id = 'msg_' || replace(replace(item_id, '_msg_1', ''), '_msg', ''), " +
+          "  item_json = replace(replace(item_json, '\"id\":\"' || item_id || '\"', '\"id\":\"msg_' || replace(replace(item_id, '_msg_1', ''), '_msg', '') || '\"'), item_id, 'msg_' || replace(replace(item_id, '_msg_1', ''), '_msg', '')) " +
+          "WHERE item_id LIKE '%_msg%' OR (item_type = 'agentMessage' AND item_id NOT LIKE 'msg%');",
+        ], { stdio: "ignore" });
+      } catch {}
     }
   } catch {}
 }
@@ -2011,6 +2107,7 @@ export function repairNativeRollouts(): number {
     let changed = false;
     for (const record of records) {
       if (normalizeStoredFunctionCallId(record)) changed = true;
+      if (normalizeStoredMessageId(record)) changed = true;
       if (record?.type === "session_meta" && record.payload?.model_provider === "openai") {
         const model = record.payload?.model || record.payload?.provenance?.model;
         if (model && !isOfficialModelSlug(String(model))) {
@@ -3683,7 +3780,7 @@ export class CodexBridgeServer {
     if (providerNames.length !== 1) return null;
 
     const providerName = providerNames[0];
-    const subscriptionKeys = ["antigravity", "grok", "claude", "cursor"];
+    const subscriptionKeys = ["antigravity", "grok", "claude", "cursor", "opencode"];
     if (subscriptionKeys.includes(providerName)) {
       return {
         name: providerName,
@@ -5539,6 +5636,7 @@ export class CodexBridgeServer {
           const hasGrok = hasGrokCredential();
           const hasClaude = hasClaudeCredential();
           const hasCursor = hasCursorCredential();
+          const hasOpencode = hasOpencodeCredential();
           const configuredThirdPartyModels = hasThirdPartyModels(
             CredentialStore.loadProviders(),
             { models: catalogModels },
@@ -5620,6 +5718,8 @@ export class CodexBridgeServer {
             grok: oauthStatus("grok", hasGrok, hasCatalogModelsForProvider(catalogModels, "grok"), isGatewayActive && hasCatalogModelsForProvider(catalogModels, "grok"), imports.grok),
             claude: oauthStatus("claude", hasClaude, hasCatalogModelsForProvider(catalogModels, "claude"), hasClaude && isGatewayActive && hasCatalogModelsForProvider(catalogModels, "claude"), imports.claude),
             cursor: oauthStatus("cursor", hasCursor, hasCatalogModelsForProvider(catalogModels, "cursor"), hasCursor && isGatewayActive && hasCatalogModelsForProvider(catalogModels, "cursor"), imports.cursor),
+            opencode: oauthStatus("opencode", hasOpencode, hasCatalogModelsForProvider(catalogModels, "opencode"), isGatewayActive && hasCatalogModelsForProvider(catalogModels, "opencode"), imports.opencode),
+            model_test_status: loadModelTestStatus(this.dataDir),
           };
           res.writeHead(200, { "Content-Type": "application/json" });
           res.end(JSON.stringify(status));
@@ -5698,8 +5798,8 @@ export class CodexBridgeServer {
             if (!Array.isArray(catalog.models)) catalog.models = [];
             preserveOfficialModels(catalog);
 
-            const addModel = (slug: string, name: string, providerName: string) => {
-              upsertProviderCatalogModel(catalog, slug, slug, name, providerName);
+            const addModel = (slug: string, name: string, providerName: string, capabilities?: any) => {
+              upsertProviderCatalogModel(catalog, slug, slug, name, providerName, "chat", capabilities);
             };
 
             if (cli === "antigravity") {
@@ -5737,6 +5837,18 @@ export class CodexBridgeServer {
               catalog.models = catalog.models.filter((m: any) => m.backend_provider !== "cursor");
               for (const m of dynamicCursorModels) {
                 addModel(m.slug, m.name, "cursor");
+              }
+            } else if (cli === "opencode") {
+              const dynamicOpencodeModels = await fetchOpencodeModelsDynamic();
+              if (dynamicOpencodeModels.length === 0) {
+                throw new Error("OpenCode 没有返回可用模型，未执行导入；请检查本机 OpenCode Desktop 是否安装");
+              }
+              catalog.models = catalog.models.filter((m: any) => m.backend_provider !== "opencode");
+              for (const m of dynamicOpencodeModels) {
+                addModel(m.slug, m.name, "opencode", {
+                  context_window: m.context_window,
+                  reasoning_efforts: m.reasoning_efforts,
+                });
               }
             }
 
@@ -6045,7 +6157,7 @@ export class CodexBridgeServer {
             let selectedCredentialId = "";
 
             const finishTest = (status: ProviderTestStatus, message: string) => {
-              if (providerName === "antigravity" || providerName === "grok" || providerName === "claude" || providerName === "cursor") {
+              if (providerName === "antigravity" || providerName === "grok" || providerName === "claude" || providerName === "cursor" || providerName === "opencode") {
                 recordSubscriptionTest(this.dataDir, providerName, status, message);
               } else {
                 recordProviderTest(providerName, status, message);
@@ -6123,6 +6235,19 @@ export class CodexBridgeServer {
                   : hasCursorCredential()
                     ? "检测到 Cursor 登录态，但可用模型获取失败"
                     : "未检测到 Cursor 登录凭证，请先完成登录"
+              );
+              return;
+            }
+
+            if (providerName === "opencode") {
+              const liveModels = await fetchOpencodeModelsDynamic();
+              finishTest(
+                liveModels.length > 0 ? "connected" : "failed",
+                liveModels.length > 0
+                  ? `OpenCode Free 订阅正常，已获取 ${liveModels.length} 个可用免费模型`
+                  : hasOpencodeCredential()
+                    ? "检测到 OpenCode 客户端，但可用模型获取失败"
+                    : "未检测到 OpenCode Desktop / CLI 客户端，请先安装 OpenCode Desktop"
               );
               return;
             }
@@ -8014,6 +8139,32 @@ export class CodexBridgeServer {
           return;
         }
 
+        if (req.method === "GET" && url.pathname === "/api/models/test-status") {
+          const statuses = loadModelTestStatus(this.dataDir);
+          res.writeHead(200, { "Content-Type": "application/json", "Cache-Control": "no-store" });
+          res.end(JSON.stringify(statuses));
+          return;
+        }
+
+        if (req.method === "POST" && url.pathname === "/api/models/test") {
+          try {
+            const body = await this.parseJsonBody(req);
+            const model = String(body.model || body.slug || body.id || "").trim();
+            if (!model) {
+              res.writeHead(400, { "Content-Type": "application/json" });
+              res.end(JSON.stringify({ status: "failed", message: "缺少模型名称" }));
+              return;
+            }
+            const result = await this.testSingleModel(model);
+            res.writeHead(200, { "Content-Type": "application/json", "Cache-Control": "no-store" });
+            res.end(JSON.stringify({ model, ...result }));
+          } catch (err: any) {
+            res.writeHead(500, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ status: "failed", message: err.message || "模型测试异常" }));
+          }
+          return;
+        }
+
         if (req.method === "GET" && url.pathname.startsWith("/api/logs")) {
           const logFiles = [
             { path: path.join(os.homedir(), ".pm2", "logs", "opencodex-out.log"), level: "info", source: "gateway" },
@@ -9087,5 +9238,150 @@ export class CodexBridgeServer {
         void closeUpstreamDispatcher().finally(resolve);
       }
     });
+  }
+
+  public async testSingleModel(rawModelName: string): Promise<{ status: ProviderTestStatus; message: string }> {
+    const requested = String(rawModelName || "").trim();
+    if (!requested) {
+      return { status: "failed", message: "缺少模型名称" };
+    }
+
+    // 1. OpenCode models
+    if (requested.startsWith("opencode/") || BUILTIN_OPENCODE_FREE_MODELS.some((m) => m.slug === requested || m.id === requested)) {
+      const result = await testOpencodeModel(requested);
+      recordModelTestStatus(this.dataDir, requested, result.status, result.message);
+      return result;
+    }
+
+    // 2. Search catalog
+    const matches = this.findCatalogMatches(requested);
+    const entry = matches[0];
+    const providerName = entry?.backend_provider || "";
+
+    if (providerName === "opencode" || requested.toLowerCase().includes("opencode")) {
+      const result = await testOpencodeModel(requested);
+      recordModelTestStatus(this.dataDir, requested, result.status, result.message);
+      return result;
+    }
+
+    if (providerName === "antigravity" || requested.startsWith("antigravity/")) {
+      const liveModels = await this.fetchAntigravityModelsDynamic();
+      const cleanSlug = requested.replace(/^antigravity\//, "");
+      const found = liveModels.some((m) => m.slug === requested || m.slug === cleanSlug || m.slug.includes(cleanSlug));
+      const status: ProviderTestStatus = (found || (hasAntigravityCredential() && liveModels.length > 0)) ? "connected" : "failed";
+      const message = found
+        ? `Google Antigravity 模型已就绪：${entry?.display_name || requested}`
+        : liveModels.length > 0
+          ? `已连接 Antigravity，当前可用模型列表中未包含此项（共 ${liveModels.length} 个模型）`
+          : (this.antigravityModelFetchError || "未检测到 Antigravity 登录凭证或实时模型获取失败");
+      recordModelTestStatus(this.dataDir, requested, status, message);
+      return { status, message };
+    }
+
+    if (providerName === "grok" || requested.startsWith("grok/")) {
+      const liveModels = await this.fetchGrokModelsDynamic();
+      const cleanSlug = requested.replace(/^grok\//, "");
+      const found = liveModels.some((m) => m.slug === requested || m.slug === cleanSlug || m.slug.includes(cleanSlug));
+      const status: ProviderTestStatus = (found || (hasGrokCredential() && liveModels.length > 0)) ? "connected" : "failed";
+      const message = found
+        ? `x.AI Grok 模型已就绪：${entry?.display_name || requested}`
+        : liveModels.length > 0
+          ? `已连接 Grok，当前可用模型列表中未包含此项（共 ${liveModels.length} 个模型）`
+          : "未检测到 Grok 登录凭证，请在终端运行 grok login";
+      recordModelTestStatus(this.dataDir, requested, status, message);
+      return { status, message };
+    }
+
+    if (providerName === "claude" || requested.startsWith("claude/")) {
+      const liveModels = await this.fetchClaudeModelsDynamic();
+      const cleanSlug = requested.replace(/^claude\//, "");
+      const found = liveModels.some((m) => m.slug === requested || m.slug === cleanSlug || m.slug.includes(cleanSlug));
+      const status: ProviderTestStatus = (found || (hasClaudeCredential() && liveModels.length > 0)) ? "connected" : "failed";
+      const message = found
+        ? `Claude 模型已就绪：${entry?.display_name || requested}`
+        : liveModels.length > 0
+          ? `已连接 Claude，当前可用模型列表中未包含此项（共 ${liveModels.length} 个模型）`
+          : (this.claudeModelFetchError || "未检测到 Claude 登录凭证或可用模型获取失败");
+      recordModelTestStatus(this.dataDir, requested, status, message);
+      return { status, message };
+    }
+
+    if (providerName === "cursor" || requested.startsWith("cursor/")) {
+      const liveModels = await this.fetchCursorModelsDynamic();
+      const cleanSlug = requested.replace(/^cursor\//, "");
+      const found = liveModels.some((m) => m.slug === requested || m.slug === cleanSlug || m.slug.includes(cleanSlug));
+      const status: ProviderTestStatus = (found || (hasCursorCredential() && liveModels.length > 0)) ? "connected" : "failed";
+      const message = found
+        ? `Cursor 模型已就绪：${entry?.display_name || requested}`
+        : liveModels.length > 0
+          ? `已连接 Cursor，当前可用模型列表中未包含此项（共 ${liveModels.length} 个模型）`
+          : "未检测到 Cursor 登录凭证，请先完成登录";
+      recordModelTestStatus(this.dataDir, requested, status, message);
+      return { status, message };
+    }
+
+    // 3. Custom API Provider from CredentialStore
+    const providers = CredentialStore.loadProviders();
+    let foundProvider = providerName ? CredentialStore.findProvider(providers, providerName) : null;
+    if (!foundProvider) {
+      foundProvider = providers.find((p: any) =>
+        p.id === providerName ||
+        p.preset_id === providerName ||
+        (Array.isArray(p.models) && p.models.some((m: any) => String(m).includes(requested))) ||
+        (Array.isArray(p.selected_models) && p.selected_models.some((m: any) => String(m).includes(requested)))
+      ) || null;
+    }
+
+    if (foundProvider) {
+      let baseUrl = String((foundProvider as any).baseUrl || (foundProvider as any).base_url || "").trim();
+      const resolved = CredentialStore.resolveApiKeyWithCredential(foundProvider);
+      const apiKey = resolved.apiKey;
+      const protocol = (foundProvider as any).protocol === "responses" ? "responses" : "chat";
+
+      if (!baseUrl || !apiKey || apiKey === "grok-cli-auto" || apiKey === "antigravity-cli-auto") {
+        const res = { status: "failed" as const, message: "服务商未配置有效 Base URL 或 API Key" };
+        recordModelTestStatus(this.dataDir, requested, res.status, res.message);
+        return res;
+      }
+
+      const backendModel = entry?.backend_model || requested.replace(/^[^/]+\//, "");
+      const providerBaseUrl = baseUrl.replace(/\/(?:chat\/completions|messages|responses)\/?$/i, "").replace(/\/$/, "");
+      const targetUrl = `${providerBaseUrl}/${protocol === "responses" ? "responses" : "chat/completions"}`;
+      const testBody = protocol === "responses"
+        ? { model: backendModel, input: "Reply with OK.", stream: false, store: false, max_output_tokens: 16 }
+        : { model: backendModel, messages: [{ role: "user", content: "Reply with OK." }], stream: false, max_tokens: 16 };
+
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 20000);
+      try {
+        const testRes = await fetch(targetUrl, {
+          method: "POST",
+          headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
+          body: JSON.stringify(testBody),
+          signal: controller.signal,
+        });
+        const responseText = await testRes.text();
+        clearTimeout(timer);
+        if (!testRes.ok) {
+          const detail = responseText.replace(/\s+/g, " ").trim().slice(0, 300);
+          const res = { status: "failed" as const, message: `模型测试失败 (HTTP ${testRes.status})：${detail}` };
+          recordModelTestStatus(this.dataDir, requested, res.status, res.message);
+          return res;
+        }
+        const res = { status: "connected" as const, message: `模型已正常返回响应：${requested}` };
+        recordModelTestStatus(this.dataDir, requested, res.status, res.message);
+        return res;
+      } catch (netErr: any) {
+        clearTimeout(timer);
+        const detail = netErr?.name === "AbortError" ? "请求超时 (20s)" : (netErr?.message || "网络请求失败");
+        const res = { status: "failed" as const, message: `模型测试失败：${detail}` };
+        recordModelTestStatus(this.dataDir, requested, res.status, res.message);
+        return res;
+      }
+    }
+
+    const res = { status: "failed" as const, message: `未找到该模型所属的服务商配置：${requested}` };
+    recordModelTestStatus(this.dataDir, requested, res.status, res.message);
+    return res;
   }
 }

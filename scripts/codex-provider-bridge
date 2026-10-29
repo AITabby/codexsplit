@@ -2,10 +2,35 @@
 set -eu
 
 BRIDGE_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
-if [ -x "$BRIDGE_DIR/../node" ]; then
+
+# 1. Environment variable override
+if [ -n "${OPENCODEX_PROVIDER_BRIDGE_NODE:-}" ] && [ -x "$OPENCODEX_PROVIDER_BRIDGE_NODE" ]; then
+  NODE="$OPENCODEX_PROVIDER_BRIDGE_NODE"
+# 2. Sibling node in app bundle
+elif [ -x "$BRIDGE_DIR/../node" ]; then
   NODE="$BRIDGE_DIR/../node"
+# 3. Path node
+elif command -v node >/dev/null 2>&1; then
+  NODE=$(command -v node)
+# 4. ~/.local/bin/node
+elif [ -n "${HOME:-}" ] && [ -x "$HOME/.local/bin/node" ]; then
+  NODE="$HOME/.local/bin/node"
+# 5. fnm active multishells / installations
+elif [ -n "${HOME:-}" ] && [ -d "$HOME/.local/state/fnm_multishells" ] && [ -n "$(find "$HOME/.local/state/fnm_multishells" -name node -type f -perm +111 2>/dev/null | head -n 1)" ]; then
+  NODE=$(find "$HOME/.local/state/fnm_multishells" -name node -type f -perm +111 2>/dev/null | head -n 1)
+elif [ -n "${HOME:-}" ] && [ -d "$HOME/.local/share/fnm" ] && [ -n "$(find "$HOME/.local/share/fnm" -name node -type f -perm +111 2>/dev/null | head -n 1)" ]; then
+  NODE=$(find "$HOME/.local/share/fnm" -name node -type f -perm +111 2>/dev/null | head -n 1)
+# 6. /opt/homebrew/bin/node
+elif [ -x "/opt/homebrew/bin/node" ]; then
+  NODE="/opt/homebrew/bin/node"
+# 7. /usr/local/bin/node
+elif [ -x "/usr/local/bin/node" ]; then
+  NODE="/usr/local/bin/node"
+# 8. nvm default
+elif [ -n "${HOME:-}" ] && [ -d "$HOME/.nvm/versions/node" ] && [ -n "$(find "$HOME/.nvm/versions/node" -name node -type f -perm +111 2>/dev/null | head -n 1)" ]; then
+  NODE=$(find "$HOME/.nvm/versions/node" -name node -type f -perm +111 2>/dev/null | head -n 1)
 else
-  NODE=${OPENCODEX_PROVIDER_BRIDGE_NODE:-node}
+  NODE=node
 fi
 
 exec "$NODE" "$BRIDGE_DIR/codex-provider-bridge.js" "$@"

@@ -4,7 +4,7 @@ import os from "node:os";
 import { randomUUID } from "node:crypto";
 import { createHash } from "node:crypto";
 
-export const SUBSCRIPTION_ACCOUNT_PROVIDERS = ["antigravity", "grok", "claude", "cursor"] as const;
+export const SUBSCRIPTION_ACCOUNT_PROVIDERS = ["antigravity", "grok", "claude", "cursor", "opencode"] as const;
 export type SubscriptionProvider = typeof SUBSCRIPTION_ACCOUNT_PROVIDERS[number];
 export type SubscriptionRotationMode = "fixed" | "round_robin";
 export type SubscriptionAccountAuthStatus = "ready" | "missing" | "disabled" | "cooldown";
@@ -153,6 +153,7 @@ function credentialFiles(provider: SubscriptionProvider, profileDir: string): st
     ];
     case "antigravity": return [path.join(profileDir, "auth.json")];
     case "cursor": return [path.join(profileDir, "credentials.json")];
+    case "opencode": return [path.join(profileDir, "auth.json")];
   }
 }
 
