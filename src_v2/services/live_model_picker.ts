@@ -54,6 +54,8 @@ const SPEECH_PROVIDER_BRANDS: Record<string, string[]> = {
   zhipu: ["glm"],
   bigmodel: ["glm"],
   moonshot: ["kimi"],
+  workbuddy: ["workbuddy", "codebuddy", "工友", "腾讯工友"],
+  codebuddy: ["workbuddy", "codebuddy", "工友", "腾讯工友"],
 };
 const MODEL_BRAND_VARIANT_OMISSIONS: Record<string, string[]> = {
   // Doubao IDs commonly contain the deployment family "seed", while people
@@ -272,6 +274,14 @@ function resolveAmbiguousModelCandidates(
     if (normalized === "opencode" || normalized === "opencode go") {
       variants.add("open code");
       variants.add("opencode");
+    }
+    if (normalized === "workbuddy" || normalized === "codebuddy") {
+      variants.add("work buddy");
+      variants.add("workbuddy");
+      variants.add("code buddy");
+      variants.add("codebuddy");
+      variants.add("工友");
+      variants.add("腾讯工友");
     }
     for (const brand of SPEECH_PROVIDER_BRANDS[normalized] || []) variants.add(brand);
     return Array.from(variants).filter(Boolean);

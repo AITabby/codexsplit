@@ -1,4 +1,4 @@
-export type SubscriptionTransportId = "antigravity" | "grok" | "claude" | "cursor" | "opencode";
+export type SubscriptionTransportId = "antigravity" | "grok" | "claude" | "cursor" | "opencode" | "workbuddy";
 
 export interface SubscriptionTransport {
   id: SubscriptionTransportId;
@@ -45,6 +45,12 @@ export const SUBSCRIPTION_TRANSPORTS: Record<SubscriptionTransportId, Subscripti
     endpoint: "https://opencode.ai/inference/openai/v1/chat/completions",
     modelsEndpoint: "https://opencode.ai/zen/v1/models",
     apiKeySentinel: "opencode-cli-auto",
+  },
+  workbuddy: {
+    id: "workbuddy",
+    endpoint: "https://www.workbuddy.ai/v2/chat/completions",
+    modelsEndpoint: "https://www.workbuddy.ai/v2/models",
+    apiKeySentinel: "workbuddy-cli-auto",
   },
 };
 

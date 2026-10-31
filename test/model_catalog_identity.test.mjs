@@ -430,6 +430,7 @@ test("Codex restart uses an explicit native or bridge launch mode", async () => 
   assert.match(gateway, /this\.launchDesktopAfterGatewayReadyIfRequested\(\);\s*resolve\(\);/);
   assert.match(gateway, /private reconcilePreferredBridgeAfterGatewayReady\(\)/);
   assert.match(gateway, /this\.reconcilePreferredBridgeAfterGatewayReady\(\)/);
+  assert.match(gateway, /currentState === "absent"[\s\S]*leaving Desktop untouched after gateway startup/);
   assert.match(gateway, /readDesktopModePreference\(\) \|\| "bridge"\) !== "bridge"/);
   assert.match(gateway, /const selectedMode = readDesktopModePreference\(\) \|\| "bridge";[\s\S]*if \(mode !== selectedMode\)/);
   assert.match(gateway, /restartDesktopClients\(true, "bridge"\)/);

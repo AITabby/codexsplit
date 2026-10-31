@@ -92,7 +92,7 @@ test("client-created thread aliases resolve to their native ids for control-plan
   } finally {
     if (previousHome === undefined) delete process.env.OPENCODEX_CODEX_HOME;
     else process.env.OPENCODEX_CODEX_HOME = previousHome;
-    await rm(tempRoot, { recursive: true, force: true });
+    await rm(tempRoot, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
   }
 });
 
@@ -176,7 +176,7 @@ test("Bridge alone does not take over a native GPT credential", async () => {
     pool.saveSettings({ rotation_enabled: true, mode: "fixed", default_account_id: "native-account" });
     assert.equal(router.credentialForRequest({ headers: { authorization: "Bearer native-token" } })?.token, "pool-token");
   } finally {
-    await rm(tempRoot, { recursive: true, force: true });
+    await rm(tempRoot, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
   }
 });
 
@@ -237,7 +237,7 @@ test("official account switching changes only the Egress credential, not a sessi
   } finally {
     if (previousDataDir === undefined) delete process.env.OPENCODEX_DATA_DIR;
     else process.env.OPENCODEX_DATA_DIR = previousDataDir;
-    await rm(tempRoot, { recursive: true, force: true });
+    await rm(tempRoot, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
   }
 });
 
@@ -443,7 +443,7 @@ if (tracePath) fs.writeFileSync(tracePath, JSON.stringify({ argv: process.argv, 
     });
     await new Promise((resolve) => nativeUpstream.close(resolve));
     await new Promise((resolve) => gateway.close(resolve));
-    await rm(tempRoot, { recursive: true, force: true });
+    await rm(tempRoot, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
   }
 });
 
@@ -605,7 +605,7 @@ rl.on("line", (line) => {
     });
     await new Promise((resolve) => nativeUpstream.close(resolve));
     await new Promise((resolve) => gateway.close(resolve));
-    await rm(tempRoot, { recursive: true, force: true });
+    await rm(tempRoot, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
   }
 });
 
@@ -706,7 +706,7 @@ if (tracePath) fs.writeFileSync(tracePath, JSON.stringify({ status: response.sta
       else bridge.once("exit", resolve);
     });
     await new Promise((resolve) => nativeUpstream.close(resolve));
-    await rm(tempRoot, { recursive: true, force: true });
+    await rm(tempRoot, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
   }
 });
 
@@ -872,6 +872,9 @@ rl.on("line", (line) => { void handleLine(line); });
     assert.equal(childSettings?.params?.threadSettings?.model, "antigravity/gemini-3.6-flash-medium");
     assert.equal(childSettings?.params?.threadSettings?.modelProvider, "opencodex");
     assert.equal(childSettings?.params?.threadSettings?.effort, "high");
+    assert.equal(childSettings?.params?.threadSettings?.collaborationMode?.mode, "default");
+    assert.equal(childSettings?.params?.threadSettings?.collaborationMode?.settings?.model, "antigravity/gemini-3.6-flash-medium");
+    assert.equal(childSettings?.params?.threadSettings?.collaborationMode?.settings?.reasoning_effort, "high");
     assert.equal(messages
       .filter((message) => message.method === "thread/settings/updated" && message.params?.threadId === "child-thread-1")
       .every((message) => message.params?.threadSettings?.effort === "high"), true);
@@ -892,7 +895,7 @@ rl.on("line", (line) => { void handleLine(line); });
       else bridge.once("exit", resolve);
     });
     await new Promise((resolve) => gateway.close(resolve));
-    await rm(tempRoot, { recursive: true, force: true });
+    await rm(tempRoot, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
   }
 });
 
@@ -1013,7 +1016,7 @@ rl.on("line", (line) => {
       if (bridge.exitCode !== null) resolve();
       else bridge.once("exit", resolve);
     });
-    await rm(tempRoot, { recursive: true, force: true });
+    await rm(tempRoot, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
   }
 });
 
@@ -1149,7 +1152,7 @@ rl.on("line", (line) => {
       if (bridge.exitCode !== null) resolve();
       else bridge.once("exit", resolve);
     });
-    await rm(tempRoot, { recursive: true, force: true });
+    await rm(tempRoot, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
   }
 });
 
@@ -1280,7 +1283,7 @@ rl.on("line", (line) => {
       if (bridge.exitCode !== null) resolve();
       else bridge.once("exit", resolve);
     });
-    await rm(tempRoot, { recursive: true, force: true });
+    await rm(tempRoot, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
   }
 });
 

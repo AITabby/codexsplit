@@ -16,6 +16,12 @@ import { tmpdir } from "node:os";
 export const NATIVE_COMPUTER_USE_EXECUTOR_NAMES = new Set([
   "mcp__node_repl_js",
   "mcp__node_repl__js",
+  "mcp__cua_repl_js",
+  "mcp__cua_repl__js",
+  "node_repl_js",
+  "node_repl__js",
+  "cua_repl_js",
+  "cua_repl__js",
 ]);
 
 // Chat providers receive flattened function names. The old working gateway
@@ -486,7 +492,11 @@ export function nativeComputerUseMcpDescriptor(name: unknown): NativeComputerUse
   const value = String(name || "").trim().toLowerCase();
   if (!isNativeComputerUseExecutorName(value)) return null;
 
-  const remainder = value.slice("mcp__".length);
+  if (value.includes("cua_repl") || value.includes("node_repl")) {
+    return { serverLabel: "node_repl", toolName: "js" };
+  }
+
+  const remainder = value.startsWith("mcp__") ? value.slice("mcp__".length) : value;
   const namespaceSeparator = remainder.indexOf("__");
   if (namespaceSeparator > 0) {
     return {

@@ -191,6 +191,8 @@ function extractXmlAndBashToolCalls(text: string): { cleanText: string; calls: a
         const parsed = JSON.parse(rawArgs);
         if (parsed.command) rawArgs = JSON.stringify({ cmd: parsed.command });
       } catch {}
+    } else if (fnName === "node_repl_js" || fnName === "node_repl__js") {
+      fnName = "mcp__node_repl_js";
     }
 
     calls.push({
@@ -201,11 +203,39 @@ function extractXmlAndBashToolCalls(text: string): { cleanText: string; calls: a
     });
   }
 
+  const dotsRegex = /<dots_function_call>[\s\S]*?(?:<invoke|invoke)\s+name=["']([^"']+)["']>([\s\S]*?)<\/invoke>\s*<\/dots_function_call>/gi;
+  while ((match = dotsRegex.exec(text)) !== null) {
+    let fnName = match[1].trim();
+    const body = match[2];
+    const params: Record<string, any> = {};
+    const paramRegex = /<parameter\s+name=["']([^"']+)["']>([\s\S]*?)<\/parameter>/gi;
+    let pm: RegExpExecArray | null;
+    while ((pm = paramRegex.exec(body)) !== null) {
+      params[pm[1].trim()] = pm[2].trim();
+    }
+    if (fnName === "node_repl_js" || fnName === "node_repl__js") {
+      fnName = "mcp__node_repl_js";
+    } else if (fnName === "run_shell" || fnName === "shell" || fnName === "bash" || fnName === "terminal") {
+      fnName = "exec_command";
+      if (params.command && !params.cmd) params.cmd = params.command;
+    }
+    calls.push({
+      index: calls.length,
+      id: `call_dots_${Date.now()}_${calls.length}`,
+      type: "function",
+      function: {
+        name: fnName,
+        arguments: JSON.stringify(params),
+      },
+    });
+  }
+
   if (calls.length > 0) {
     if (text.includes("montee") || text.includes("mont_call")) {
       cleanText = cleanText.replace(/(?:montee\d+a|mont_?call_?)(exec_command|view_file|list_dir|write_stdin)[\s\S]*?(?=(?:\n\n|\n[A-Z\u4e00-\u9fa5]|$))/gi, "");
     }
     cleanText = cleanText
+      .replace(/<dots_function_call>[\s\S]*?<\/dots_function_call>/gi, "")
       .replace(/<bash>[\s\S]*?<\/bash>/gi, "")
       .replace(/<tool_calls>[\s\S]*?<\/tool_calls>/gi, "")
       .replace(/<tool_call(?:\s+name=["'][^"']+["'])?\s*>[\s\S]*?<\/tool_call>/gi, "")
@@ -214,6 +244,66 @@ function extractXmlAndBashToolCalls(text: string): { cleanText: string; calls: a
   }
 
   return { cleanText, calls };
+}
+
+export class XmlToolTagFilter {
+  private buffer = "";
+
+  public filter(chunk: string): { text: string; calls: any[] } {
+    this.buffer += chunk;
+    const calls: any[] = [];
+    let text = "";
+
+    const hasCompleteDots = /<dots_function_call>[\s\S]*?<\/dots_function_call>/i.test(this.buffer);
+    const hasCompleteToolCall = /<tool_call(?:\s+name=["'][^"']+["'])?\s*>[\s\S]*?<\/tool_call>/i.test(this.buffer);
+    const hasCompleteBash = /<bash>[\s\S]*?<\/bash>/i.test(this.buffer);
+
+    if (hasCompleteDots || hasCompleteToolCall || hasCompleteBash) {
+      const extracted = extractXmlAndBashToolCalls(this.buffer);
+      if (extracted.calls.length > 0) {
+        calls.push(...extracted.calls);
+        this.buffer = extracted.cleanText;
+      }
+    }
+
+    const openTagRegex = /<(?:dots_function_call|tool_call|bash)\b/i;
+    const match = openTagRegex.exec(this.buffer);
+    if (match) {
+      if (match.index > 0) {
+        text += this.buffer.slice(0, match.index);
+        this.buffer = this.buffer.slice(match.index);
+      }
+      return { text, calls };
+    }
+
+    const partials = ["<dots_function_call", "<tool_call", "<bash"];
+    let partialMatchLen = 0;
+    for (const tag of partials) {
+      for (let i = 1; i <= tag.length; i++) {
+        if (this.buffer.endsWith(tag.slice(0, i))) {
+          partialMatchLen = Math.max(partialMatchLen, i);
+        }
+      }
+    }
+
+    if (partialMatchLen > 0) {
+      text += this.buffer.slice(0, -partialMatchLen);
+      this.buffer = this.buffer.slice(-partialMatchLen);
+      return { text, calls };
+    }
+
+    text += this.buffer;
+    this.buffer = "";
+    return { text, calls };
+  }
+
+  public flush(): { text: string; calls: any[] } {
+    if (!this.buffer) return { text: "", calls: [] };
+    const extracted = extractXmlAndBashToolCalls(this.buffer);
+    const text = extracted.cleanText;
+    this.buffer = "";
+    return { text, calls: extracted.calls };
+  }
 }
 
 interface ToolCallState {
@@ -323,6 +413,7 @@ export class ResponsesStreamEngine {
   private providerReasoningContent = "";
 
   private thinkFilter = new ThinkTagFilter();
+  private xmlToolFilter = new XmlToolTagFilter();
   private turnId?: string;
   private forceCommentary = false;
   private internalToolNames: Set<string>;
@@ -805,7 +896,7 @@ export class ResponsesStreamEngine {
         await this.emitReasoningDelta(emit, thinkReasoning);
       }
       if (filteredText) {
-        const { cleanText, calls: parsedXmlCalls } = extractXmlAndBashToolCalls(filteredText);
+        const { text: cleanText, calls: parsedXmlCalls } = this.xmlToolFilter.filter(filteredText);
         if (cleanText) {
           await this.closeReasoning(emit);
           await this.emitTextDelta(emit, cleanText);
@@ -833,11 +924,18 @@ export class ResponsesStreamEngine {
     }
     await this.closeReasoning(emit);
 
+    const { text: flushedToolText, calls: flushedToolCalls } = this.xmlToolFilter.flush();
+    for (const call of flushedToolCalls) {
+      await this.closeReasoning(emit);
+      await this.emitToolDelta(emit, call);
+    }
+
     const hasTools = Object.keys(this.toolCalls).length > 0;
     const messagePhase = this.forceCommentary || hasTools ? "commentary" : "final_answer";
     const hasImages = this.imageGenerations.length > 0;
-    if (flushedText && !this.messageClosed) {
-      await this.emitTextDelta(emit, flushedText);
+    const pendingText = [flushedText, flushedToolText].filter(Boolean).join("");
+    if (pendingText && !this.messageClosed) {
+      await this.emitTextDelta(emit, pendingText);
     }
 
     if (!hasTools && !hasImages && (!this.messageText || this.messageText.trim().length === 0)) {

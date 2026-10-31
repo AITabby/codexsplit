@@ -53,7 +53,7 @@ test("OAuth account-pool endpoints expose pool state without credentials", async
     const headers = { Authorization: `Bearer ${token}` };
     const listed = await request(`http://127.0.0.1:${port}/api/cli-bridge/accounts`, { headers });
     assert.equal(listed.status, 200);
-    assert.deepEqual(Object.keys(listed.json.providers).sort(), ["antigravity", "claude", "cursor", "grok", "opencode"]);
+    assert.deepEqual(Object.keys(listed.json.providers).sort(), ["antigravity", "claude", "cursor", "grok", "opencode", "workbuddy"]);
     assert.equal(listed.json.providers.grok.settings.mode, "round_robin");
     assert.equal(listed.json.providers.grok.accounts.length, 0);
     assert.doesNotMatch(listed.body, /access_token|refresh_token|Bearer/);

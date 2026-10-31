@@ -2006,8 +2006,46 @@ function threadIdFrom(value: unknown): string {
   return cleanString(value);
 }
 
+function sanitizeParentPayload(value: JsonRecord): JsonRecord {
+  if (!value || typeof value !== "object") return value;
+  if (value.method === "thread/settings/updated" && value.params && typeof value.params === "object") {
+    const params = value.params as JsonRecord;
+    if (params.threadSettings && typeof params.threadSettings === "object") {
+      const ts = params.threadSettings as JsonRecord;
+      const model = cleanString(ts.model) || cleanString(ts.collaborationMode?.settings?.model) || "";
+      const effort = ts.effort !== undefined ? ts.effort : (ts.collaborationMode?.settings?.reasoning_effort ?? null);
+      if (!ts.collaborationMode || typeof ts.collaborationMode !== "object") {
+        ts.collaborationMode = {
+          mode: "default",
+          settings: {
+            model,
+            reasoning_effort: effort,
+            developer_instructions: null,
+          },
+        };
+      } else {
+        const collab = ts.collaborationMode as JsonRecord;
+        if (!collab.settings || typeof collab.settings !== "object") {
+          collab.settings = {
+            model: model || cleanString(collab.model) || "",
+            reasoning_effort: effort,
+            developer_instructions: null,
+          };
+        } else {
+          if (model && !collab.settings.model) collab.settings.model = model;
+          if (effort !== undefined && (collab.settings.reasoning_effort === undefined || collab.settings.reasoning_effort === null)) {
+            collab.settings.reasoning_effort = effort;
+          }
+        }
+      }
+    }
+  }
+  return value;
+}
+
 function writeParent(value: JsonRecord): void {
-  process.stdout.write(`${JSON.stringify(value)}\n`);
+  const sanitized = sanitizeParentPayload(value);
+  process.stdout.write(`${JSON.stringify(sanitized)}\n`);
 }
 
 function responseError(id: unknown, message: string, code = -32001): JsonRecord {
@@ -2272,6 +2310,8 @@ async function runProviderBridge(): Promise<void> {
     const modelProvider = update.model
       ? (classifyRuntimeModel(update.model) || (update.model.includes("/") ? GATEWAY_PROVIDER : NATIVE_PROVIDER))
       : GATEWAY_PROVIDER;
+    const model = update.model || "";
+    const effort = update.effort || null;
     writeParent({
       method: "thread/settings/updated",
       params: {
@@ -2279,7 +2319,15 @@ async function runProviderBridge(): Promise<void> {
         threadSettings: {
           ...(update.model ? { model: update.model } : {}),
           modelProvider,
-          ...(update.effort ? { effort: update.effort } : {}),
+          effort,
+          collaborationMode: {
+            mode: "default",
+            settings: {
+              model,
+              reasoning_effort: effort,
+              developer_instructions: null,
+            },
+          },
         },
       },
     });
@@ -2352,11 +2400,13 @@ async function runProviderBridge(): Promise<void> {
         const savedNativeId = cleanString(value.nativeId);
         if (!externalId) continue;
         const nativeId = externalId.startsWith("019") || externalId.startsWith("thread-") ? externalId : (savedNativeId || externalId);
+        const nativePath = cleanString(value.nativePath) || undefined;
+        const isArchived = value.archived === true || (nativePath ? isArchivedNativeRolloutPath(nativePath) : false);
         result.set(externalId, {
           externalId,
           nativeId,
-          nativePath: cleanString(value.nativePath) || undefined,
-          archived: value.archived === true ? true : undefined,
+          nativePath,
+          archived: isArchived ? true : undefined,
           retiredNativeIds: Array.isArray(value.retiredNativeIds)
             ? value.retiredNativeIds.map(cleanString).filter(Boolean).slice(-16)
             : undefined,
@@ -2435,9 +2485,9 @@ async function runProviderBridge(): Promise<void> {
   }
 
   function shouldRepairArchivedRoute(route: ThreadRoute): boolean {
-    // Native conversations keep their native archive semantics. Older bridge
-    // versions left some provider routes with a stale archive flag; repair
-    // that route state when the native app-server reports the archived error.
+    // Native conversations keep their native archive semantics. When resuming
+    // a third-party route, repair archived route state if native reports the
+    // archived error.
     return providerForModel(route.selectedModel) === GATEWAY_PROVIDER;
   }
 
@@ -2968,6 +3018,45 @@ async function runProviderBridge(): Promise<void> {
         settings.modelProvider = modelProvider;
       }
       if (effort) settings.effort = effort;
+      const targetModel = model || cleanString(settings.model) || "";
+      const targetEffort = effort !== undefined ? effort : (settings.effort ?? null);
+      if (!settings.collaborationMode || typeof settings.collaborationMode !== "object") {
+        settings.collaborationMode = {
+          mode: "default",
+          settings: {
+            model: targetModel,
+            reasoning_effort: targetEffort,
+            developer_instructions: null,
+          },
+        };
+      } else {
+        const collab = settings.collaborationMode as JsonRecord;
+        if (!collab.settings || typeof collab.settings !== "object") {
+          collab.settings = {
+            model: targetModel,
+            reasoning_effort: targetEffort,
+            developer_instructions: null,
+          };
+        } else {
+          if (targetModel) collab.settings.model = targetModel;
+          if (targetEffort !== undefined) collab.settings.reasoning_effort = targetEffort;
+        }
+      }
+    }
+    if (record.collaborationMode && typeof record.collaborationMode === "object") {
+      const collab = record.collaborationMode as JsonRecord;
+      const targetModel = model || cleanString(collab.model) || "";
+      const targetEffort = effort !== undefined ? effort : null;
+      if (!collab.settings || typeof collab.settings !== "object") {
+        collab.settings = {
+          model: targetModel,
+          reasoning_effort: targetEffort,
+          developer_instructions: null,
+        };
+      } else {
+        if (targetModel) collab.settings.model = targetModel;
+        if (targetEffort !== undefined) collab.settings.reasoning_effort = targetEffort;
+      }
     }
     if (effort && ("reasoningEffort" in record || "effort" in record)) {
       if ("reasoningEffort" in record) record.reasoningEffort = effort;
@@ -3001,14 +3090,35 @@ async function runProviderBridge(): Promise<void> {
   }
 
   function emitSyntheticSettings(threadId: string, model: string, effort?: string): void {
+    const route = routeForThreadId(threadId);
+    const existingSettings = route?.settings;
+    const cleanModel = cleanString(model);
+    const cleanEffort = effort !== undefined ? effort : null;
+    const modelProvider = providerForModel(cleanModel);
     writeParent({
       method: "thread/settings/updated",
       params: {
         threadId,
         threadSettings: {
-          model,
-          modelProvider: providerForModel(model),
-          ...(effort ? { effort } : {}),
+          cwd: existingSettings?.cwd ?? null,
+          approvalPolicy: existingSettings?.approvalPolicy ?? null,
+          approvalsReviewer: existingSettings?.approvalsReviewer ?? null,
+          sandboxPolicy: existingSettings?.sandbox ?? null,
+          activePermissionProfile: existingSettings?.activePermissionProfile ?? null,
+          model: cleanModel,
+          modelProvider,
+          serviceTier: existingSettings?.serviceTier ?? null,
+          effort: cleanEffort,
+          summary: null,
+          collaborationMode: {
+            mode: "default",
+            settings: {
+              model: cleanModel,
+              reasoning_effort: cleanEffort,
+              developer_instructions: existingSettings?.developerInstructions ?? null,
+            },
+          },
+          personality: existingSettings?.personality ?? null,
         },
       },
     });
@@ -3860,7 +3970,8 @@ async function runProviderBridge(): Promise<void> {
           const result = response.result && typeof response.result === "object" ? response.result as JsonRecord : {};
           const thread = result.thread && typeof result.thread === "object" ? result.thread as JsonRecord : {};
           updateRouteNativePath(route, thread);
-          route.archived = false;
+          const isArchived = thread.archived === true || (cleanString(thread.path) ? isArchivedNativeRolloutPath(cleanString(thread.path)) : false);
+          route.archived = isArchived ? true : false;
           saveRoute(route);
         }
         return decorateParentResponse(response, {
@@ -4007,6 +4118,11 @@ async function runProviderBridge(): Promise<void> {
           entry.id = route.externalId;
           entry.model = route.selectedModel;
           entry.modelProvider = providerForModel(route.selectedModel);
+          if (typeof entry.archived === "boolean") {
+            route.archived = entry.archived;
+          } else if (Boolean(nextParams.archived)) {
+            route.archived = true;
+          }
         } else {
           const childDisplay = nativeSubagentDisplaySettings.get(id);
           if (childDisplay?.model) {
@@ -4033,6 +4149,7 @@ async function runProviderBridge(): Promise<void> {
       return output;
     };
 
+    const isArchivedList = Boolean(nextParams.archived);
     const restoreMissingThirdPartyRoutes = (
       runtime: ProviderRuntime,
       seen: Set<string>,
@@ -4040,6 +4157,7 @@ async function runProviderBridge(): Promise<void> {
     ): void => {
       const candidates = Array.from(routes.values()).filter((route) =>
         providerForModel(route.selectedModel) === GATEWAY_PROVIDER
+        && Boolean(route.archived) === isArchivedList
         && !seen.has(route.externalId)
         && !seen.has(route.nativeId)
         && !hiddenLegacy.has(route.nativeId),
@@ -4060,13 +4178,14 @@ async function runProviderBridge(): Promise<void> {
         // the same local native conversation directly before deciding that the
         // route is gone; this also avoids inventing sidebar entries for stale
         // map records whose physical conversation no longer exists.
-        const readRoute = (allowArchiveRepair = true): void => sendInternal(
+        const readRoute = (allowArchiveRepair = !isArchivedList): void => sendInternal(
           runtime,
           "thread/read",
           { threadId: route.nativeId, includeTurns: false },
           (response) => {
           if (response.error
             && allowArchiveRepair
+            && !isArchivedList
             && shouldRepairArchivedRoute(route)
             && isArchivedThreadResponse(response)) {
             restoreArchivedProviderRoute(route, runtime, (restoredRoute) => {
@@ -4091,6 +4210,9 @@ async function runProviderBridge(): Promise<void> {
               entry.id = route.externalId;
               entry.model = route.selectedModel;
               entry.modelProvider = providerForModel(route.selectedModel);
+              if (typeof entry.archived === "boolean") {
+                route.archived = entry.archived;
+              }
               if (!entry.path && route.nativePath) entry.path = route.nativePath;
               if (!entry.cwd && route.settings?.cwd) entry.cwd = route.settings.cwd;
               restored.push(entry);
@@ -4099,7 +4221,7 @@ async function runProviderBridge(): Promise<void> {
           complete();
           },
         );
-        readRoute();
+        readRoute(!isArchivedList);
       }
     };
 
@@ -4187,7 +4309,8 @@ async function runProviderBridge(): Promise<void> {
           const result = response.result && typeof response.result === "object" ? response.result as JsonRecord : {};
           const thread = result.thread && typeof result.thread === "object" ? result.thread as JsonRecord : {};
           updateRouteNativePath(route, thread);
-          route.archived = false;
+          const isArchived = thread.archived === true || (cleanString(thread.path) ? isArchivedNativeRolloutPath(cleanString(thread.path)) : false);
+          route.archived = isArchived ? true : false;
           saveRoute(route);
         }
         return decorateParentResponse(response, {
@@ -4370,13 +4493,20 @@ async function runProviderBridge(): Promise<void> {
           : {}),
       };
       const archiveMutation = method === "thread/archive" || method === "thread/unarchive";
+      const isDelete = method === "thread/delete";
       sendParent(native, message, method, nextParams, {
         externalThreadId: route.externalId,
         physicalThreadId: route.nativeId,
         displayModel: route.selectedModel || nativeDefaultModel(),
         displayProvider: providerForModel(route.selectedModel || nativeDefaultModel()),
         onResponse: (response) => {
-          if (!response.error && archiveMutation) {
+          if (isDelete) {
+            routes.delete(route.externalId);
+            routes.delete(route.nativeId);
+            legacyThreads.delete(route.externalId);
+            legacyThreads.delete(route.nativeId);
+            persistRoutes();
+          } else if (!response.error && archiveMutation) {
             if (method === "thread/unarchive") {
               const result = response.result && typeof response.result === "object"
                 ? response.result as JsonRecord

@@ -20,6 +20,7 @@ import { applyDefaultReasoningCapabilities, CatalogSyncService, buildFullCatalog
 import { SubscriptionAuthService } from "../services/subscription_auth.js";
 import { fetchCursorModels } from "../services/cursor_protocol.js";
 import { fetchOpencodeModelsDynamic, findOpencodeCliPath, testOpencodeModel, BUILTIN_OPENCODE_FREE_MODELS } from "../services/opencode_transport.js";
+import { fetchWorkbuddyModelsDynamic, testWorkbuddyModel, BUILTIN_WORKBUDDY_FREE_MODELS } from "../services/workbuddy_transport.js";
 import { getAntigravityUserAgent, getClaudeDesktopVersion, getCursorClientVersion, getGrokUserAgent } from "../services/subscription_auth.js";
 import { copyNativeRequestHeaders, handleWebRtcProxy, normalizeNativeLiveCallBody, readNativeAccountCredential, resolveRealtimeUpstream } from "./webrtc_proxy.js";
 import { ProviderConfig, ProviderModelTestState } from "../core/types.js";
@@ -1921,6 +1922,10 @@ function hasOpencodeCredential(): boolean {
   return SubscriptionAuthService.hasOpencodeCredential();
 }
 
+function hasWorkbuddyCredential(): boolean {
+  return SubscriptionAuthService.hasWorkbuddyCredential();
+}
+
 function hasCatalogModelsForProvider(catalogModels: any[], providerName: string): boolean {
   return catalogModels.some((model: any) => model?.backend_provider === providerName);
 }
@@ -3012,8 +3017,16 @@ export class CodexBridgeServer {
     // Bridge is the durable default. Only an explicit native preference
     // suppresses reattachment after the gateway itself restarts.
     if ((readDesktopModePreference() || "bridge") !== "bridge") return;
-    if (desktopAppServerState() === "bridge") {
+    const currentState = desktopAppServerState();
+    if (currentState === "bridge") {
       console.log("[CodexSplit Gateway] Desktop Bridge is already attached; gateway restart leaves the existing Desktop untouched.");
+      return;
+    }
+    // Gateway startup (e.g. boot-time LaunchAgent) must never auto-launch
+    // Desktop if Desktop is absent. Relaunching remains explicit via the
+    // dashboard restart marker, or reattaches when Desktop is already running.
+    if (currentState === "absent") {
+      console.log("[CodexSplit Gateway] Desktop is not currently running; leaving Desktop untouched after gateway startup.");
       return;
     }
     if (!desktopBridgeRuntimeAvailable()) {
@@ -3021,7 +3034,7 @@ export class CodexBridgeServer {
       return;
     }
     const launchTimer = setTimeout(() => {
-      if ((readDesktopModePreference() || "bridge") !== "bridge" || desktopAppServerState() === "bridge") return;
+      if ((readDesktopModePreference() || "bridge") !== "bridge" || desktopAppServerState() !== "native") return;
       restartDesktopClients(true, "bridge");
       console.log("[CodexSplit Gateway] Gateway is ready; restored the selected Desktop Bridge mode after restart.");
       const verifyTimer = setTimeout(() => {
@@ -3780,7 +3793,7 @@ export class CodexBridgeServer {
     if (providerNames.length !== 1) return null;
 
     const providerName = providerNames[0];
-    const subscriptionKeys = ["antigravity", "grok", "claude", "cursor", "opencode"];
+    const subscriptionKeys = ["antigravity", "grok", "claude", "cursor", "opencode", "workbuddy"];
     if (subscriptionKeys.includes(providerName)) {
       return {
         name: providerName,
@@ -3826,6 +3839,9 @@ export class CodexBridgeServer {
       // The Codex catalog/UI may namespace imported models (`opencode/...` or
       // `opencode-go/...`), while OpenCode's API expects the bare model ID.
       return model.replace(/^opencode(?:-go)?\//i, "");
+    }
+    if (providerId === "workbuddy") {
+      return model.replace(/^workbuddy\//i, "");
     }
     return model;
   }
@@ -5563,6 +5579,28 @@ export class CodexBridgeServer {
           return;
         }
 
+        if (req.method === "POST" && url.pathname === "/api/cli-bridge/accounts/credential") {
+          try {
+            const body = await this.parseJsonBody(req);
+            const provider = String(body?.provider || "").trim().toLowerCase() as SubscriptionProvider;
+            if (!(SUBSCRIPTION_ACCOUNT_PROVIDERS as readonly string[]).includes(provider)) throw new Error("OAuth / 订阅 Provider 不受支持");
+            const result = await this.subscriptionAccountLogin.addDirectCredential(provider, {
+              label: body?.label,
+              token: body?.token,
+              accessToken: body?.accessToken || body?.access_token,
+              refreshToken: body?.refreshToken || body?.refresh_token,
+              apiKey: body?.apiKey || body?.api_key,
+              sessionKey: body?.sessionKey || body?.session_key,
+            });
+            res.writeHead(200, { "Content-Type": "application/json", "Cache-Control": "no-store" });
+            res.end(JSON.stringify(result));
+          } catch (err: any) {
+            res.writeHead(400, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ error: err.message }));
+          }
+          return;
+        }
+
         const subscriptionLoginStatusPathMatch = url.pathname.match(/^\/api\/cli-bridge\/accounts\/login-status\/([^/]+)$/);
         if (subscriptionLoginStatusPathMatch && req.method === "GET") {
           const login = this.subscriptionAccountLogin.getFlow(decodeURIComponent(subscriptionLoginStatusPathMatch[1]));
@@ -5637,6 +5675,7 @@ export class CodexBridgeServer {
           const hasClaude = hasClaudeCredential();
           const hasCursor = hasCursorCredential();
           const hasOpencode = hasOpencodeCredential();
+          const hasWorkbuddy = hasWorkbuddyCredential();
           const configuredThirdPartyModels = hasThirdPartyModels(
             CredentialStore.loadProviders(),
             { models: catalogModels },
@@ -5669,13 +5708,15 @@ export class CodexBridgeServer {
           const oauthStatus = (provider: SubscriptionProvider, detected: boolean, imported: boolean, active: boolean, test: any) => {
             const pool = this.subscriptionAccountPool.describe(provider);
             const pendingLogin = this.subscriptionAccountLogin.getPending(provider);
+            const isFree = provider === "opencode" || provider === "workbuddy";
             const accountCount = pool.accounts.length || (detected ? 1 : 0);
             return {
               auth_mode: "oauth",
-              detected: Boolean(detected || pool.accounts.some((account) => account.auth_status === "ready")),
+              detected: Boolean(isFree || detected || pool.accounts.some((account) => account.auth_status === "ready")),
               account_count: accountCount,
               pool_mode: pool.settings.mode,
               pool_supported: true,
+              is_free: isFree,
               accounts: pool.accounts.map((account) => ({
                 id: account.id,
                 label: account.label,
@@ -5686,6 +5727,7 @@ export class CodexBridgeServer {
               })),
               login_supported: SUBSCRIPTION_LOGIN_CAPABILITIES[provider].login_supported,
               capture_supported: SUBSCRIPTION_LOGIN_CAPABILITIES[provider].capture_supported,
+              direct_entry_supported: SUBSCRIPTION_LOGIN_CAPABILITIES[provider].direct_entry_supported,
               login_in_progress: Boolean(pendingLogin),
               ...(pendingLogin ? { login_flow_id: pendingLogin.id } : {}),
               imported: Boolean(imported),
@@ -5719,6 +5761,7 @@ export class CodexBridgeServer {
             claude: oauthStatus("claude", hasClaude, hasCatalogModelsForProvider(catalogModels, "claude"), hasClaude && isGatewayActive && hasCatalogModelsForProvider(catalogModels, "claude"), imports.claude),
             cursor: oauthStatus("cursor", hasCursor, hasCatalogModelsForProvider(catalogModels, "cursor"), hasCursor && isGatewayActive && hasCatalogModelsForProvider(catalogModels, "cursor"), imports.cursor),
             opencode: oauthStatus("opencode", hasOpencode, hasCatalogModelsForProvider(catalogModels, "opencode"), isGatewayActive && hasCatalogModelsForProvider(catalogModels, "opencode"), imports.opencode),
+            workbuddy: oauthStatus("workbuddy", hasWorkbuddy, hasCatalogModelsForProvider(catalogModels, "workbuddy"), isGatewayActive && hasCatalogModelsForProvider(catalogModels, "workbuddy"), imports.workbuddy),
             model_test_status: loadModelTestStatus(this.dataDir),
           };
           res.writeHead(200, { "Content-Type": "application/json" });
@@ -5840,12 +5883,34 @@ export class CodexBridgeServer {
               }
             } else if (cli === "opencode") {
               const dynamicOpencodeModels = await fetchOpencodeModelsDynamic();
-              if (dynamicOpencodeModels.length === 0) {
-                throw new Error("OpenCode 没有返回可用模型，未执行导入；请检查本机 OpenCode Desktop 是否安装");
-              }
+              const opencodeList = dynamicOpencodeModels.length > 0
+                ? dynamicOpencodeModels
+                : BUILTIN_OPENCODE_FREE_MODELS.map((m) => ({
+                    slug: m.slug,
+                    name: m.name,
+                    context_window: m.contextWindow,
+                    reasoning_efforts: m.reasoningEfforts,
+                  }));
               catalog.models = catalog.models.filter((m: any) => m.backend_provider !== "opencode");
-              for (const m of dynamicOpencodeModels) {
+              for (const m of opencodeList) {
                 addModel(m.slug, m.name, "opencode", {
+                  context_window: m.context_window,
+                  reasoning_efforts: m.reasoning_efforts,
+                });
+              }
+            } else if (cli === "workbuddy") {
+              const dynamicWorkbuddyModels = await fetchWorkbuddyModelsDynamic();
+              const workbuddyList = dynamicWorkbuddyModels.length > 0
+                ? dynamicWorkbuddyModels
+                : BUILTIN_WORKBUDDY_FREE_MODELS.map((m) => ({
+                    slug: m.slug,
+                    name: m.name,
+                    context_window: m.contextWindow,
+                    reasoning_efforts: m.reasoningEfforts,
+                  }));
+              catalog.models = catalog.models.filter((m: any) => m.backend_provider !== "workbuddy");
+              for (const m of workbuddyList) {
+                addModel(m.slug, m.name, "workbuddy", {
                   context_window: m.context_window,
                   reasoning_efforts: m.reasoning_efforts,
                 });
@@ -6157,7 +6222,7 @@ export class CodexBridgeServer {
             let selectedCredentialId = "";
 
             const finishTest = (status: ProviderTestStatus, message: string) => {
-              if (providerName === "antigravity" || providerName === "grok" || providerName === "claude" || providerName === "cursor" || providerName === "opencode") {
+              if (providerName === "antigravity" || providerName === "grok" || providerName === "claude" || providerName === "cursor" || providerName === "opencode" || providerName === "workbuddy") {
                 recordSubscriptionTest(this.dataDir, providerName, status, message);
               } else {
                 recordProviderTest(providerName, status, message);
@@ -6248,6 +6313,19 @@ export class CodexBridgeServer {
                   : hasOpencodeCredential()
                     ? "检测到 OpenCode 客户端，但可用模型获取失败"
                     : "未检测到 OpenCode Desktop / CLI 客户端，请先安装 OpenCode Desktop"
+              );
+              return;
+            }
+
+            if (providerName === "workbuddy") {
+              const liveModels = await fetchWorkbuddyModelsDynamic();
+              finishTest(
+                liveModels.length > 0 ? "connected" : "failed",
+                liveModels.length > 0
+                  ? `WorkBuddy Free 订阅正常，已获取 ${liveModels.length} 个可用免费模型`
+                  : hasWorkbuddyCredential()
+                    ? "检测到 WorkBuddy 客户端，但可用模型获取失败；请确保 WorkBuddy AI 桌面应用正在运行"
+                    : "未检测到 WorkBuddy AI 桌面应用，请先安装或启动 WorkBuddy AI"
               );
               return;
             }
@@ -9253,6 +9331,13 @@ export class CodexBridgeServer {
       return result;
     }
 
+    // 1.1 WorkBuddy models
+    if (requested.startsWith("workbuddy/") || BUILTIN_WORKBUDDY_FREE_MODELS.some((m) => m.slug === requested || m.id === requested)) {
+      const result = await testWorkbuddyModel(requested);
+      recordModelTestStatus(this.dataDir, requested, result.status, result.message);
+      return result;
+    }
+
     // 2. Search catalog
     const matches = this.findCatalogMatches(requested);
     const entry = matches[0];
@@ -9260,6 +9345,12 @@ export class CodexBridgeServer {
 
     if (providerName === "opencode" || requested.toLowerCase().includes("opencode")) {
       const result = await testOpencodeModel(requested);
+      recordModelTestStatus(this.dataDir, requested, result.status, result.message);
+      return result;
+    }
+
+    if (providerName === "workbuddy" || requested.toLowerCase().includes("workbuddy")) {
+      const result = await testWorkbuddyModel(requested);
       recordModelTestStatus(this.dataDir, requested, result.status, result.message);
       return result;
     }

@@ -30,6 +30,7 @@ import { CredentialStore } from "../services/credential_store.js";
 import { resolveSubscriptionTransport } from "../services/provider_transports.js";
 import { bindResponseAbort, linkAbortSignal, readWithAbortAndTimeout } from "../services/request_lifecycle.js";
 import { streamOpencodeChat } from "../services/opencode_transport.js";
+import { streamWorkbuddyChat } from "../services/workbuddy_transport.js";
 
 export class ProviderCredentialError extends Error {
   public readonly statusCode: number;
@@ -1931,6 +1932,11 @@ export class GatewayRouter {
       && (!apiKey || apiKey === "opencode-cli-auto")
       && !isAntigravityModel && !isGrokModel && !isClaudeModel && !isCursorModel;
 
+    // WorkBuddy Free Subscription Routing
+    const isWorkbuddyModel = (subscriptionTransport?.id === "workbuddy" || upstreamModel.startsWith("workbuddy/"))
+      && (!apiKey || apiKey === "workbuddy-cli-auto")
+      && !isAntigravityModel && !isGrokModel && !isClaudeModel && !isCursorModel && !isOpencodeModel;
+
     // Ask OpenAI-compatible Chat endpoints for their actual stream usage when
     // supported. This is optional metadata; providers that omit it still work
     // and the Responses engine will simply leave usage absent.
@@ -2255,6 +2261,17 @@ export class GatewayRouter {
           upstreamModel,
           {
             reasoningEffort: String(reqBody?.reasoning?.effort || reqBody?.reasoning_effort || "").trim() || undefined,
+            tools: optimizedChatBody.tools,
+          },
+          controller.signal,
+        );
+      } else if (isWorkbuddyModel) {
+        response = await streamWorkbuddyChat(
+          optimizedChatBody.messages,
+          upstreamModel,
+          {
+            reasoningEffort: String(reqBody?.reasoning?.effort || reqBody?.reasoning_effort || "").trim() || undefined,
+            tools: optimizedChatBody.tools,
           },
           controller.signal,
         );

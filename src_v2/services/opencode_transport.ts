@@ -4,6 +4,7 @@ import os from "node:os";
 import { spawn, execFileSync, ChildProcess } from "node:child_process";
 import readline from "node:readline";
 import { randomBytes } from "node:crypto";
+import { streamCloudFreeChat } from "./workbuddy_transport.js";
 
 export interface OpencodeModelDef {
   id: string;
@@ -368,15 +369,15 @@ export function promptFromMessages(messages: any[]): string {
 export async function streamOpencodeChat(
   messages: any[],
   model: string,
-  options: { reasoningEffort?: string; timeoutMs?: number } = {},
+  options: { reasoningEffort?: string; timeoutMs?: number; tools?: any[] } = {},
   signal?: AbortSignal,
 ): Promise<Response> {
+  const cleanModelId = model.startsWith("opencode/") ? model.slice("opencode/".length) : model;
   const cliPath = findOpencodeCliPath();
   if (!cliPath) {
-    throw new Error("未检测到本机 OpenCode Desktop / CLI 客户端，请先安装 OpenCode Desktop");
+    // Cloud free direct fallback: 0 local software required
+    return streamCloudFreeChat(messages, cleanModelId, options, signal);
   }
-
-  const cleanModelId = model.startsWith("opencode/") ? model.slice("opencode/".length) : model;
   const prompt = promptFromMessages(messages);
   const effort = options.reasoningEffort;
 
@@ -653,10 +654,6 @@ export async function testOpencodeModel(
   model: string,
   timeoutMs = 15000,
 ): Promise<{ status: "connected" | "failed"; message: string }> {
-  const cliPath = findOpencodeCliPath();
-  if (!cliPath) {
-    return { status: "failed", message: "未检测到本机 OpenCode Desktop / CLI 客户端" };
-  }
   const cleanModelId = model.startsWith("opencode/") ? model.slice("opencode/".length) : model;
 
   // Use the local HTTP server or direct streaming chat to test end-to-end inference

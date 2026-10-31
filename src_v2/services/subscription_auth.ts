@@ -14,6 +14,7 @@ import crypto from "node:crypto";
 import { execFileSync } from "node:child_process";
 import { SubscriptionAccountPool, type SubscriptionProvider } from "./subscription_account_pool.js";
 import { findOpencodeCliPath } from "./opencode_transport.js";
+import { hasWorkbuddyCredential } from "./workbuddy_transport.js";
 
 function defaultGrokAuthDir(): string {
   const configured = String(process.env.OPENCODEX_GROK_AUTH_DIR || process.env.GROK_AUTH_DIR || "").trim();
@@ -1190,6 +1191,10 @@ export class SubscriptionAuthService {
   }
 
   public static hasOpencodeCredential(): boolean {
-    return Boolean(findOpencodeCliPath());
+    return true;
+  }
+
+  public static hasWorkbuddyCredential(): boolean {
+    return hasWorkbuddyCredential();
   }
 }

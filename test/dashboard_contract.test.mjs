@@ -94,7 +94,7 @@ test("dashboard keeps the API-key directory searchable and height-stable when ex
     "provider-search",
     "provider-search-clear",
     "provider-directory-scroll",
-    "height:446px",
+    "height:555px",
     "overflow-y:scroll",
     "scrollbar-gutter:stable",
     "state.providerSearch",

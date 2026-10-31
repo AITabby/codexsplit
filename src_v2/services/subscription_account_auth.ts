@@ -1,3 +1,5 @@
+import fs from "node:fs";
+import path from "node:path";
 import { spawn, type ChildProcess } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { SubscriptionAccountPool, subscriptionProfileHasCredential, type SubscriptionProvider, type SubscriptionAccountView, type SubscriptionLoginProfile } from "./subscription_account_pool.js";
@@ -25,12 +27,48 @@ function safeError(error: unknown): string {
     .slice(0, 320);
 }
 
-export const SUBSCRIPTION_LOGIN_CAPABILITIES: Record<SubscriptionProvider, { login_supported: boolean; capture_supported: boolean; login_hint: string }> = {
-  antigravity: { login_supported: false, capture_supported: true, login_hint: "请先在 Antigravity 客户端切换到目标账号，再捕获当前登录态" },
-  grok: { login_supported: true, capture_supported: true, login_hint: "将打开 Grok OAuth 登录页，并写入独立账号目录" },
-  claude: { login_supported: true, capture_supported: true, login_hint: "将打开 Claude 订阅登录页，并写入独立账号目录" },
-  cursor: { login_supported: false, capture_supported: true, login_hint: "请先在 Cursor 客户端切换到目标账号，再捕获当前登录态" },
-  opencode: { login_supported: false, capture_supported: false, login_hint: "自动连接本机 OpenCode Desktop / Free 免费轮换订阅" },
+export const SUBSCRIPTION_LOGIN_CAPABILITIES: Record<SubscriptionProvider, {
+  login_supported: boolean;
+  capture_supported: boolean;
+  direct_entry_supported: boolean;
+  login_hint: string;
+}> = {
+  antigravity: {
+    login_supported: false,
+    capture_supported: true,
+    direct_entry_supported: true,
+    login_hint: "支持直接填入 Token / 凭证，或从 Antigravity 客户端一键捕获当前登录态",
+  },
+  grok: {
+    login_supported: true,
+    capture_supported: true,
+    direct_entry_supported: true,
+    login_hint: "支持直接填入 Grok API Key / 凭证，或启动 Grok OAuth 网页登录",
+  },
+  claude: {
+    login_supported: true,
+    capture_supported: true,
+    direct_entry_supported: true,
+    login_hint: "支持直接填入 Claude API Key / Token，或启动 Claude 网页登录",
+  },
+  cursor: {
+    login_supported: false,
+    capture_supported: true,
+    direct_entry_supported: true,
+    login_hint: "支持直接填入 Cursor Token / Key，或从 Cursor 客户端一键捕获当前登录态",
+  },
+  opencode: {
+    login_supported: false,
+    capture_supported: false,
+    direct_entry_supported: true,
+    login_hint: "公共免费订阅：零装机即用；亦可填入自定义 OpenCode Token",
+  },
+  workbuddy: {
+    login_supported: false,
+    capture_supported: false,
+    direct_entry_supported: true,
+    login_hint: "公共免费订阅：零装机即用；亦可填入自定义 WorkBuddy Token",
+  },
 };
 
 export class SubscriptionAccountLoginService {
@@ -98,6 +136,116 @@ export class SubscriptionAccountLoginService {
     } catch (error) {
       this.pool.removeAccount(provider, account.id);
       this.pool.discardLoginProfile({ id: account.id, provider, label: account.label, profile_dir: account.profile_dir });
+      throw error;
+    }
+  }
+
+  public async addDirectCredential(
+    provider: SubscriptionProvider,
+    input: {
+      label?: unknown;
+      token?: unknown;
+      accessToken?: unknown;
+      refreshToken?: unknown;
+      apiKey?: unknown;
+      sessionKey?: unknown;
+    },
+  ): Promise<{ account: SubscriptionAccountView; created: boolean }> {
+    const rawToken = String(
+      input.token || input.accessToken || input.apiKey || input.sessionKey || "",
+    ).trim();
+    if (!rawToken) {
+      throw new Error(`请填写有效的 ${provider} Token 或凭证`);
+    }
+
+    this.pool.compactDuplicateAccounts(provider);
+    const account = this.pool.createAccount({ provider, label: input.label });
+
+    try {
+      fs.mkdirSync(account.profile_dir, { recursive: true, mode: 0o700 });
+      try { fs.chmodSync(account.profile_dir, 0o700); } catch {}
+
+      const writeJson = (filePath: string, data: any) => {
+        const tempPath = `${filePath}.tmp-${process.pid}-${Date.now()}`;
+        fs.writeFileSync(tempPath, JSON.stringify(data, null, 2), { encoding: "utf-8", mode: 0o600 });
+        try { fs.chmodSync(tempPath, 0o600); } catch {}
+        fs.renameSync(tempPath, filePath);
+        try { fs.chmodSync(filePath, 0o600); } catch {}
+      };
+
+      const refreshTok = String(input.refreshToken || "").trim();
+
+      if (provider === "cursor") {
+        writeJson(path.join(account.profile_dir, "credentials.json"), {
+          accessToken: rawToken,
+          refreshToken: refreshTok || rawToken,
+        });
+      } else if (provider === "antigravity") {
+        let authData: any;
+        if (rawToken.startsWith("{") && rawToken.endsWith("}")) {
+          try {
+            authData = JSON.parse(rawToken);
+          } catch {}
+        }
+        if (!authData || typeof authData !== "object") {
+          authData = {
+            token: {
+              access_token: rawToken,
+              refresh_token: refreshTok || rawToken,
+              expiry: "2099-01-01T00:00:00Z",
+            },
+          };
+        }
+        writeJson(path.join(account.profile_dir, "auth.json"), authData);
+      } else if (provider === "claude") {
+        const payload = {
+          accessToken: rawToken,
+          refreshToken: refreshTok,
+          expiresAt: Date.now() + 365 * 86400 * 1000,
+        };
+        writeJson(path.join(account.profile_dir, "credentials.json"), payload);
+        writeJson(path.join(account.profile_dir, "claude_desktop_auth.json"), payload);
+      } else if (provider === "grok") {
+        writeJson(path.join(account.profile_dir, "auth.json"), {
+          default: {
+            token: rawToken,
+            key: rawToken,
+          },
+        });
+      } else {
+        // opencode / workbuddy
+        writeJson(path.join(account.profile_dir, "auth.json"), {
+          token: rawToken,
+          mode: "direct",
+        });
+      }
+
+      const captured = this.pool.getAccount(provider, account.id);
+      if (!captured || captured.auth_status !== "ready") {
+        throw new Error("凭证写入后未生成可用状态");
+      }
+
+      const duplicate = this.pool.findDuplicateCredential(provider, account.profile_dir, account.id);
+      if (duplicate) {
+        this.pool.removeAccount(provider, account.id);
+        this.pool.discardLoginProfile({
+          id: account.id,
+          provider,
+          label: account.label,
+          profile_dir: account.profile_dir,
+        });
+        return { account: duplicate, created: false };
+      }
+
+      return { account: captured, created: true };
+    } catch (error) {
+      this.pool.removeAccount(provider, account.id);
+      this.pool.discardLoginProfile({
+        id: account.id,
+        provider,
+        label: account.label,
+        profile_dir: account.profile_dir,
+      });
       throw error;
     }
   }

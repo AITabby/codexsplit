@@ -801,6 +801,11 @@ test("provider-only native switch escapes an unavailable gateway in the same thr
       params: { threadId: "thread-1", model: "antigravity/gemini-3.6-flash-medium" },
     });
     assert.deepEqual(await waitForResponse(messages, 12), { id: 12, result: {} });
+    const settingsNotification = await waitForNotification(messages, (m) => m.method === "thread/settings/updated");
+    assert.ok(settingsNotification, "thread/settings/updated notification must be emitted");
+    assert.equal(settingsNotification.params.threadId, "thread-1");
+    assert.equal(settingsNotification.params.threadSettings.model, "antigravity/gemini-3.6-flash-medium");
+    assert.equal(settingsNotification.params.threadSettings.collaborationMode.settings.model, "antigravity/gemini-3.6-flash-medium");
 
     send({
       id: 13,
